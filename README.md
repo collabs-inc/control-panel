@@ -60,6 +60,10 @@ it is preserved as source, not configured to run on this Cube.
 Cube's gate signs every visitor in before a request reaches the panel, so
 there is no PIN screen and no Cloudflare Access check; the loopback bind and
 the cross-origin protection stay on. It cannot be combined with `-cf-team`.
+The flag trusts anything that reaches the panel's own port: the PIN used to
+cover a program on the same machine, and a page that re-points its domain at
+`127.0.0.1`, calling that port directly. On a cloud Cube no browser can reach
+it; on a local machine, prefer the PIN.
 Data stays in `~/.config/control-panel` and `~/.local/state/control-panel`,
 outside the app's folder, so an update keeps it.
 
