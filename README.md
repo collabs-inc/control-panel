@@ -36,9 +36,9 @@ cd /workspace/home/repos/adrian-control-panel
 
 The PIN prompt accepts 6–32 digits. Use your own PIN; no Adrian credentials
 are needed. The app binds to loopback. Local mode skips Cloudflare Access
-checks but retains the app's PIN authentication. Session cookies are marked
-Secure, so use a browser's localhost context or an HTTPS reverse proxy when
-accessing the UI. For access from another computer, forward port 7777 over
+checks but retains the app's PIN authentication. In this explicit testing
+mode, session cookies work over HTTP. Cloudflare mode keeps HTTPS-only
+cookies. For access from another computer, forward port 7777 over
 SSH and open `http://localhost:7777` there.
 
 For a deployed HTTPS instance, configure your own Cloudflare Access team,

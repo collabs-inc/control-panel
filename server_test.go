@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -626,5 +627,53 @@ func TestClientErrorsAreLoggedWithTheBrowser(t *testing.T) {
 	var got struct{ Msg, Stack, UA, View string }
 	if json.Unmarshal(b, &got) != nil || got.Msg != "ReferenceError: D is not defined @ app.js:812" || got.View != "term" || !strings.Contains(got.UA, "iPhone OS 17_5") || got.Stack == "" {
 		t.Fatalf("logged %s", b)
+	}
+}
+
+// Local HTTP clients must retain the session after successfully entering a PIN.
+func TestLocalHTTPLoginPersistsAndLogoutClearsSession(t *testing.T) {
+	e := newTestServer(t)
+	e.s.cfg.insecure = true
+	e.s.access = nil
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+	resp, err := client.Post(e.srv.URL+"/api/login", "application/json", strings.NewReader(`{"pin":"482913"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("login: %d", resp.StatusCode)
+	}
+	cookies := resp.Cookies()
+	if len(cookies) != 1 || cookies[0].Secure || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatal("local HTTP cookie flags incorrect")
+	}
+	resp, err = client.Get(e.srv.URL + "/api/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("session lost after login: %d", resp.StatusCode)
+	}
+	resp, err = client.Post(e.srv.URL+"/api/logout", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("logout: %d", resp.StatusCode)
+	}
+	if len(jar.Cookies(resp.Request.URL)) != 0 {
+		t.Fatal("logout did not clear cookie")
+	}
+	resp, err = client.Get(e.srv.URL + "/api/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("session survived logout: %d", resp.StatusCode)
 	}
 }

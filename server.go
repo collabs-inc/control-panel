@@ -337,14 +337,14 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	tok := s.auth.newSession(identity(r))
 	http.SetCookie(w, &http.Cookie{Name: "cp_session", Value: tok, Path: "/", HttpOnly: true,
-		Secure: true, SameSite: http.SameSiteStrictMode, MaxAge: int(sessionIdle.Seconds())})
+		Secure: !s.cfg.insecure || r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: int(sessionIdle.Seconds())})
 	s.audit.add("login", identity(r), clientIP(r))
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (s *server) logout(w http.ResponseWriter, r *http.Request) {
 	s.auth.endSession(sessionToken(r))
-	http.SetCookie(w, &http.Cookie{Name: "cp_session", Value: "", Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode, MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{Name: "cp_session", Value: "", Path: "/", HttpOnly: true, Secure: !s.cfg.insecure || r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: -1})
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
