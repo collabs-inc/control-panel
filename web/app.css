@@ -211,8 +211,9 @@ main { padding: 0 16px calc(var(--nav-h) + 24px + env(safe-area-inset-bottom)); 
 .tile.bad .v { color: var(--bad); }
 .spark { display: block; width: 100%; height: 38px; margin-top: 10px; }
 
+/* Live samples replace these meters; paint their current value without a zero-to-value transition. */
 .bar { height: 6px; border-radius: 99px; background: var(--surface-3); overflow: hidden; }
-.bar > i { display: block; height: 100%; width: 0; border-radius: inherit; background: var(--accent); transition: width .5s ease; }
+.bar > i { display: block; height: 100%; width: 0; border-radius: inherit; background: var(--accent); }
 .bar.warn > i { background: var(--warn); }
 .bar.bad > i { background: var(--bad); }
 .meter { display: grid; gap: 6px; }
@@ -226,7 +227,7 @@ main { padding: 0 16px calc(var(--nav-h) + 24px + env(safe-area-inset-bottom)); 
 .fill { display: flex; flex-direction: column; }
 .fill > .cores { flex: 1; grid-auto-rows: minmax(40px, 1fr); }
 .core { min-height: 40px; border-radius: 6px; background: var(--surface-3); position: relative; overflow: hidden; }
-.core > i { position: absolute; left: 0; right: 0; bottom: 0; height: 0; background: var(--accent); opacity: .85; transition: height .5s ease; }
+.core > i { position: absolute; left: 0; right: 0; bottom: 0; height: 0; background: var(--accent); opacity: .85; }
 .core > span { position: absolute; inset: 0; display: grid; place-items: center; font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
 
 /* ---------- process table ---------- */
