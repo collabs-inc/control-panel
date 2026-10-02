@@ -1,0 +1,5 @@
+/control-panel
+/panel.env
+/run/
+/.local-state/
+*.token

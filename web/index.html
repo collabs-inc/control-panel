@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0c0f">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Panel">
+<title>Control Panel</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.json" crossorigin="use-credentials">
+<link rel="stylesheet" href="app.css">
+<script src="report.js" defer></script>
+<script src="lib.js" defer></script>
+<script src="icons.js" defer></script>
+<script src="app.js" defer></script>
+</head>
+<body>
+<div id="login" class="login" hidden>
+  <form id="login-form" class="login-card" autocomplete="off">
+    <svg class="i lock" aria-hidden="true"><use href="#i-lock-keyhole"/></svg>
+    <h1>Control Panel</h1>
+    <p class="muted">Enter your PIN to continue</p>
+    <input id="pin" type="password" inputmode="numeric" pattern="[0-9]*" autocomplete="current-password" maxlength="32" required aria-label="PIN">
+    <button type="submit" class="btn primary wide">Unlock</button>
+    <p id="login-err" class="err" role="alert"></p>
+  </form>
+</div>
+
+<div id="app" class="app" hidden>
+  <nav class="nav" aria-label="Sections">
+    <i class="glide" aria-hidden="true"></i>
+    <div class="brand"><svg class="i" aria-hidden="true"><use href="#i-wave-pulse"/></svg><span>Control Panel</span></div>
+    <button class="nav-btn" data-view="res" title="Resources"><svg class="i" aria-hidden="true"><use href="#i-cpu"/></svg><span>Resources</span><b class="badge" data-badge="res"></b></button>
+    <button class="nav-btn" data-view="ci" title="CI"><svg class="i" aria-hidden="true"><use href="#i-play-circle3"/></svg><span>CI</span><b class="badge" data-badge="ci"></b></button>
+    <button class="nav-btn" data-view="term" title="Terminals"><svg class="i" aria-hidden="true"><use href="#i-terminal-square"/></svg><span>Terminals</span><b class="badge" data-badge="term"></b></button>
+    <button class="nav-btn" data-view="sec" title="Security"><svg class="i" aria-hidden="true"><use href="#i-shield-check"/></svg><span>Security</span><b class="badge" data-badge="sec"></b></button>
+    <button id="nav-mini" class="nav-tg" type="button" aria-label="Collapse sidebar" title="Collapse sidebar"><svg class="i" aria-hidden="true"><use href="#i-sidebar-left2"/></svg><span>Collapse</span></button>
+  </nav>
+  <main>
+    <header class="top">
+      <h1 id="title">Resources</h1>
+      <div id="top-stats" class="top-stats num"></div>
+      <span id="conn" class="conn" role="status" aria-label="connecting"></span>
+      <button id="logout" class="icon-btn" aria-label="Lock panel" title="Lock"><svg class="i" aria-hidden="true"><use href="#i-lock-keyhole"/></svg></button>
+    </header>
+    <section id="view" class="view" aria-live="off"></section>
+  </main>
+</div>
+
+<dialog id="modal" class="modal">
+  <form id="modal-form">
+    <div class="modal-h"><span id="modal-ic" class="modal-ic"><svg class="i" aria-hidden="true"><use href="#i-alert-triangle"/></svg></span><h2 id="modal-title"></h2></div>
+    <p id="modal-msg" class="muted"></p>
+    <p id="modal-err" class="err" role="alert"></p>
+    <div class="modal-actions">
+      <button type="button" id="modal-cancel" class="btn">Cancel</button>
+      <button type="submit" id="modal-ok" class="btn danger">Confirm</button>
+    </div>
+  </form>
+</dialog>
+<div id="drawer" class="drawer" aria-labelledby="dr-title" hidden>
+  <header class="dr-head">
+    <button id="dr-close" class="icon-btn ghost" aria-label="Back to terminals"><svg class="i" aria-hidden="true"><use href="#i-angle-left"/></svg></button>
+    <button id="dr-railbtn" class="icon-btn ghost" type="button" aria-label="Show the terminal list" title="Show the terminal list"><svg class="i flip" aria-hidden="true"><use href="#i-sidebar-left2"/></svg></button>
+    <button id="dr-switch-btn" class="dr-t" type="button" aria-haspopup="true" aria-expanded="false" title="Switch terminal">
+      <span class="dr-tl"><h2 id="dr-title"></h2><svg class="i dr-chev" aria-hidden="true"><use href="#i-angle-down"/></svg></span>
+      <span id="dr-sub" class="dr-sub"></span>
+    </button>
+    <span id="dr-pill" class="pill"></span>
+    <button id="dr-filesbtn" class="hbtn" type="button" hidden><svg class="i" aria-hidden="true"><use href="#i-folder-open"/></svg><span>Files</span><span id="dr-filescnt" class="cnt"></span></button>
+    <div class="seg" role="tablist" aria-label="View">
+      <i class="seg-pill" aria-hidden="true"></i><button type="button" data-mode="chat" role="tab"><svg class="i" aria-hidden="true"><use href="#i-chat-round-dots"/></svg><span>Chat</span></button><button type="button" data-mode="screen" role="tab"><svg class="i" aria-hidden="true"><use href="#i-terminal-square"/></svg><span>Terminal</span></button>
+    </div>
+    <button id="dr-menu" class="icon-btn ghost" type="button" aria-label="More actions" aria-haspopup="menu"><svg class="i" aria-hidden="true"><use href="#i-more-h"/></svg></button>
+  </header>
+  <div class="dr-main">
+    <nav id="dr-rail" class="dr-rail" aria-label="All terminals"><div class="rl-in"><label class="rl-q"><svg class="i" aria-hidden="true"><use href="#i-search"/></svg><input type="search" placeholder="Search terminals" aria-label="Search terminals" autocomplete="off" spellcheck="false"><button type="button" class="rl-hide" aria-label="Hide the terminal list" title="Hide the terminal list"><svg class="i" aria-hidden="true"><use href="#i-sidebar-left2"/></svg></button></label><div class="rl-list"><i class="glide" aria-hidden="true"></i><div class="rl-items"></div></div></div></nav>
+    <section class="dr-center">
+      <div id="dr-body" class="dr-body" aria-live="off"></div>
+      <div id="dr-term" class="dr-term" hidden>
+        <pre id="term-sb" class="term sb" aria-label="Terminal history"></pre><pre id="term-pre" class="term" aria-label="Terminal"></pre>
+        <textarea id="term-in" class="term-in" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="Type into the terminal"></textarea>
+      </div>
+      <div id="dr-keys" class="tkeys" hidden>
+        <button type="button" data-tk="esc">esc</button><button type="button" data-tk="tab">tab</button>
+        <button type="button" data-tk="ctrl" aria-pressed="false">ctrl</button><button type="button" data-tk="alt" aria-pressed="false">alt</button>
+        <button type="button" data-tk="up" aria-label="Up"><svg class="i" aria-hidden="true"><use href="#i-arrow-up"/></svg></button><button type="button" data-tk="down" aria-label="Down"><svg class="i" aria-hidden="true"><use href="#i-arrow-down"/></svg></button>
+        <button type="button" data-tk="left" aria-label="Left"><svg class="i" aria-hidden="true"><use href="#i-arrow-left"/></svg></button><button type="button" data-tk="right" aria-label="Right"><svg class="i" aria-hidden="true"><use href="#i-arrow-right"/></svg></button>
+        <button type="button" data-tk="cc" aria-label="Control C">^C</button>
+        <button type="button" data-tk="kbd" aria-label="Keyboard"><svg class="i" aria-hidden="true"><use href="#i-keyboard"/></svg></button>
+      </div>
+      <footer id="dr-foot" class="dr-foot">
+        <div id="dr-prompt" class="dr-prompt" hidden></div>
+        <form id="dr-form" class="composer" autocomplete="off">
+          <button type="button" id="dr-down" class="tobottom" aria-label="Jump to the latest" title="Jump to the latest"><svg class="i" aria-hidden="true"><use href="#i-arrow-down"/></svg></button>
+          <div id="dr-cmds" class="cmds" role="listbox" aria-label="Commands" hidden></div>
+          <div id="dr-models" class="cmds models" hidden></div>
+          <div id="dr-files-chips" class="files" hidden></div>
+          <textarea id="dr-text" rows="1" placeholder="Message Claude, or / for commands" aria-label="Message" aria-autocomplete="list" aria-controls="dr-cmds"></textarea>
+          <div class="ctools">
+            <button type="button" id="dr-attach" class="cbtn" aria-label="Attach files" title="Attach files"><svg class="i" aria-hidden="true"><use href="#i-plus"/></svg></button>
+            <button type="button" id="dr-slash" class="cbtn slash" aria-label="Commands" title="Commands (type /)">/</button>
+            <button type="button" id="dr-model" class="mpill" aria-haspopup="true" aria-expanded="false" title="Model and effort"><span id="dr-model-t">Model</span><span id="dr-model-b" class="pbars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span></button>
+            <button type="submit" id="dr-send" class="cbtn send" aria-label="Send" disabled><svg class="i" aria-hidden="true"><use href="#i-arrow-up"/></svg></button>
+          </div>
+        </form>
+        <input id="dr-file" type="file" multiple hidden>
+      </footer>
+      <div id="dr-drop" class="dr-drop" hidden><div><svg class="i" aria-hidden="true"><use href="#i-upload2"/></svg><b id="dr-drop-t">Drop files to attach</b></div></div>
+    </section>
+    <aside id="dr-files" class="dr-files" hidden></aside>
+    <section id="dr-sa" class="dr-preview dr-sa" aria-label="Subagent" hidden><header id="sa-h" class="pv-h"></header><div id="sa-body" class="dr-body"></div></section>
+    <section id="dr-preview" class="dr-preview" aria-label="File preview" hidden></section>
+  </div>
+  <div id="dr-switch" class="dr-switch" hidden><label class="rl-q"><svg class="i" aria-hidden="true"><use href="#i-search"/></svg><input type="search" placeholder="Search terminals" aria-label="Search terminals" autocomplete="off" spellcheck="false"></label><div class="rl-items"></div></div>
+</div>
+
+<dialog id="newdlg" class="modal">
+  <form id="new-form">
+    <h2 id="new-title"></h2>
+    <label class="fld"><span>Name</span><input id="new-name" maxlength="64" autocomplete="off" spellcheck="false"></label>
+    <label class="fld"><span>Directory</span><select id="new-cwd-sel"></select></label>
+    <label class="fld" id="new-cwd-f" hidden><span>Other directory</span><input id="new-cwd" autocomplete="off" spellcheck="false" placeholder="~/path/to/folder"></label>
+    <label class="fld"><span>Start</span><select id="new-run"><option value="shell">Shell</option><option value="claude">Claude (claude-multi)</option></select></label>
+    <label class="fld" id="new-dir-f"><span>Split</span><select id="new-dir"><option value="">Auto</option><option value="right">Right</option><option value="down">Down</option></select></label>
+    <p id="new-err" class="err" role="alert"></p>
+    <div class="modal-actions">
+      <button type="button" id="new-cancel" class="btn">Cancel</button>
+      <button type="submit" id="new-ok" class="btn primary">Create</button>
+    </div>
+  </form>
+</dialog>
+<div id="menu" class="menu" role="menu" hidden></div>
+<div id="selbar" class="selbar" hidden><button type="button" data-sel="quote"><svg class="i" aria-hidden="true"><use href="#i-quote-up"/></svg>Quote</button><button type="button" data-sel="copy"><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg>Copy</button></div>
+<div id="toast" class="toast" role="status" hidden></div>
+<button id="update" class="update" type="button" hidden>Panel updated · <b>Reload</b></button>
+</body>
+</html>
