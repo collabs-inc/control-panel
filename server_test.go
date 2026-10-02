@@ -363,7 +363,7 @@ func TestTermNew(t *testing.T) {
 	}
 	want := []string{
 		"--session dev-1 action new-pane --tab-id 2 --no-focus --cwd " + cwd + " --name logs --direction down",
-		"--session dev-1 action write-chars --pane-id terminal_7 -- claude-multi",
+		"--session dev-1 action write-chars --pane-id terminal_7 -- claude",
 		"--session dev-1 action send-keys --pane-id terminal_7 Enter",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {

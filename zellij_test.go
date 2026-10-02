@@ -172,8 +172,8 @@ func TestParsePromptIgnoresNumberedListsInOutput(t *testing.T) {
 	}
 }
 
-const trustScreen = `claude-multi
-➜  /tmp claude-multi
+const trustScreen = `claude
+➜  /tmp claude
 
 ────────────────────────────────────────────────
  Accessing workspace:

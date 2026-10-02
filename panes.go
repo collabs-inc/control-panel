@@ -474,8 +474,8 @@ func (s *server) termNew(w http.ResponseWriter, r *http.Request) {
 	}
 	what := fmt.Sprintf("new %s %s %q in %s", b.What, session, name, tilde(cwd))
 	if err == nil && b.Run == "claude" {
-		what += " running claude-multi" // the owner's launcher (teamclaude); typed like over SSH so aliases work
-		if err = s.z.write(session, pane, "claude-multi"); err == nil {
+		what += " running claude" // Launch the standard Claude CLI from the shell PATH.
+		if err = s.z.write(session, pane, "claude"); err == nil {
 			err = s.z.keys(session, pane, "Enter")
 		}
 	}
