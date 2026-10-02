@@ -50,7 +50,8 @@ it is preserved as source, not configured to run on this Cube.
 ## Integration dependencies
 
 The system views use Linux `/proc` and utilities such as `du`, `nice`, and
-`ionice`. Terminal controls use Zellij and do not automatically expose
+`ionice`. Zellij 0.45.1 is installed at `~/.local/bin/zellij`. Terminal controls
+create and use their own Zellij sessions; they do not automatically expose
 Cube's ptyd terminals. Claude views expect the local user's Claude session
 files. CI views expect runner directories under `~/projects/ci-cd-jobs`,
 which you can change with `-ci-dir`; GitHub title lookup uses `gh`.
@@ -58,3 +59,12 @@ which you can change with `-ci-dir`; GitHub title lookup uses `gh`.
 The application reads the home directory of the user running it. Run it
 as your normal Cube user. It includes process, terminal, and cleanup actions
 that operate on this Cube once you use them.
+
+## Local instance status
+
+The instance was started on October 2, 2026, on `127.0.0.1:7777`.
+Its PID and log are in `.local-state/server.pid` and `.local-state/server.log`.
+The configured PIN hash is in `.local-state/pin`; runtime files are ignored by
+Git. The server is a background process, not a service configured for restart.
+Browser login and creation of the `control-panel-demo` Zellij session were
+verified on this Cube.
