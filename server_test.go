@@ -718,3 +718,104 @@ func TestEmbeddedLocalCookieAndCrossSiteProtection(t *testing.T) {
 		t.Fatal("embedded local mode must be explicitly local")
 	}
 }
+
+// newLocalServer is a panel with no Cloudflare Access: -behind-cube when behindCube, else -insecure-no-access.
+// No PIN file exists, so the only way in is the mode itself.
+func newLocalServer(t *testing.T, behindCube bool) *testEnv {
+	t.Helper()
+	dir := t.TempDir()
+	s := newServer(config{
+		addr: "127.0.0.1:0", pinFile: filepath.Join(dir, "pin"), auditFile: filepath.Join(dir, "audit.jsonl"),
+		ciDir: filepath.Join(dir, "ci"), statusDir: filepath.Join(dir, "status"), home: dir,
+		insecure: !behindCube, behindCube: behindCube,
+	})
+	if s.access != nil {
+		t.Fatal("a local panel checks Cloudflare Access")
+	}
+	s.sys.sockDir = filepath.Join(dir, "zellij-sockets") // never the real sessions
+	os.MkdirAll(s.sys.sockDir, 0o755)
+	z, _ := newFakeZellij(nil)
+	s.z, s.term.z = z, z
+	ts := httptest.NewServer(s.handler())
+	t.Cleanup(ts.Close)
+	return &testEnv{srv: ts, s: s, audit: filepath.Join(dir, "audit.jsonl")}
+}
+
+// Behind Cube, the gate has signed the visitor in before the request arrives: no PIN, no Access, no cookie.
+func TestBehindCubeTreatsEveryRequestAsSession(t *testing.T) {
+	e := newLocalServer(t, true)
+	r := e.do(t, "GET", "/api/me", "", nil)
+	var me struct{ BehindCube bool }
+	json.NewDecoder(r.Body).Decode(&me)
+	if r.StatusCode != 200 || !me.BehindCube {
+		t.Fatalf("/api/me with no cookie: %d %+v", r.StatusCode, me)
+	}
+	if r := e.do(t, "GET", "/", "", nil); r.StatusCode != 200 {
+		t.Fatalf("page: %d", r.StatusCode)
+	}
+	// The stream outlives a ping: its session check must not end it.
+	pingEvery = 50 * time.Millisecond
+	defer func() { pingEvery = 15 * time.Second }()
+	req, _ := http.NewRequest("GET", e.srv.URL+"/api/stream?view=sec", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("stream: %d %q", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	pings := make(chan struct{})
+	go func() {
+		sc := bufio.NewScanner(resp.Body)
+		n := 0
+		for sc.Scan() {
+			if sc.Text() == ": ping" {
+				if n++; n == 3 {
+					close(pings)
+					return
+				}
+			}
+		}
+	}()
+	select {
+	case <-pings:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream ended or never pinged")
+	}
+	// Cross-origin protection still applies; a same-origin action is let through to the handler.
+	if r := e.do(t, "POST", "/api/action/kill", `{"pid":999999}`, map[string]string{"Sec-Fetch-Site": "cross-site"}); r.StatusCode != 403 {
+		t.Fatalf("cross-site action: %d", r.StatusCode)
+	}
+	host := strings.TrimPrefix(e.srv.URL, "http://")
+	if r := e.do(t, "POST", "/api/action/kill", `{"pid":999999}`, map[string]string{"Origin": "http://evil.example"}); r.StatusCode != 403 {
+		t.Fatalf("cross-origin action: %d", r.StatusCode)
+	}
+	if r := e.do(t, "POST", "/api/action/kill", `{"pid":999999}`, map[string]string{"Origin": "http://" + host}); r.StatusCode != 400 {
+		t.Fatalf("same-origin action: %d", r.StatusCode)
+	}
+}
+
+func TestWithoutBehindCubeASessionIsStillRequired(t *testing.T) {
+	e := newLocalServer(t, false)
+	for _, p := range []string{"/api/me", "/api/stream?view=res"} {
+		if r := e.do(t, "GET", p, "", nil); r.StatusCode != 401 {
+			t.Errorf("GET %s with no cookie: %d", p, r.StatusCode)
+		}
+	}
+}
+
+func TestBehindCubeConfig(t *testing.T) {
+	if err := validateConfig(config{addr: "127.0.0.1:7777", behindCube: true}); err != nil {
+		t.Error(err)
+	}
+	if err := validateConfig(config{addr: "0.0.0.0:7777", behindCube: true}); err == nil {
+		t.Error("-behind-cube on 0.0.0.0 accepted")
+	}
+	if err := validateConfig(config{addr: "127.0.0.1:7777", behindCube: true, cfTeam: "my-team", cfAUD: "abc"}); err == nil {
+		t.Error("-behind-cube with -cf-team accepted")
+	}
+	if err := validateConfig(config{addr: "127.0.0.1:7777", behindCube: true, cfTeam: "my-team"}); err == nil {
+		t.Error("-behind-cube with -cf-team alone accepted")
+	}
+}

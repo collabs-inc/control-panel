@@ -51,6 +51,18 @@ application audience, and tunnel, then replace `-insecure-no-access` with
 is Adrian's original deployment helper and contains his directory layout;
 it is preserved as source, not configured to run on this Cube.
 
+## Run as a Cube app
+
+`cube-app.json` makes this repository a Cube app: Cube clones it, runs
+`install.sh` (which builds the binary with Go from `PATH`, or from
+`~/.local/share/control-panel-toolchain/go/bin`), and starts
+`./control-panel -behind-cube -addr 127.0.0.1:$PORT`. With `-behind-cube`,
+Cube's gate signs every visitor in before a request reaches the panel, so
+there is no PIN screen and no Cloudflare Access check; the loopback bind and
+the cross-origin protection stay on. It cannot be combined with `-cf-team`.
+Data stays in `~/.config/control-panel` and `~/.local/state/control-panel`,
+outside the app's folder, so an update keeps it.
+
 ## Integration dependencies
 
 The system views use Linux `/proc` and utilities such as `du`, `nice`, and

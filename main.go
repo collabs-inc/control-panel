@@ -27,6 +27,7 @@ func main() {
 	fs.StringVar(&cfg.statusDir, "status-dir", "/tmp/claude-tab-status", "claude-tab-status output")
 	fs.BoolVar(&cfg.embedLocal, "embed-local", false, "partition session cookies for embedding via localhost (requires -insecure-no-access)")
 	fs.BoolVar(&cfg.insecure, "insecure-no-access", false, "skip Cloudflare Access checks (local testing only)")
+	fs.BoolVar(&cfg.behindCube, "behind-cube", false, "run as a Cube app: Cube's gate signs every visitor in, so no PIN and no Access (not with -cf-team)")
 
 	args := os.Args[1:]
 	if len(args) > 0 && args[0] == "set-pin" {
@@ -41,7 +42,9 @@ func main() {
 	if err := validateConfig(cfg); err != nil {
 		log.Fatal(err)
 	}
-	if cfg.insecure {
+	if cfg.behindCube {
+		log.Println("-behind-cube: Cube's gate signs visitors in; the panel asks for no PIN.")
+	} else if cfg.insecure {
 		log.Println("WARNING: -insecure-no-access: Cloudflare Access is NOT checked. Local testing only.")
 	}
 	s := newServer(cfg)

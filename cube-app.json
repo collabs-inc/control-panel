@@ -1,0 +1,8 @@
+{
+  "name": "Control Panel",
+  "description": "Resources, CI, terminals and security for your Cube",
+  "icon": "web/icon.svg",
+  "platforms": ["linux"],
+  "install": "./install.sh",
+  "start": "./control-panel -behind-cube -addr 127.0.0.1:$PORT"
+}

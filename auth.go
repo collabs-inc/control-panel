@@ -157,6 +157,7 @@ type auth struct {
 	pinFile string
 	audit   *auditLog
 	now     func() time.Time
+	gated   bool // -behind-cube: Cube's gate signed the visitor in, so every request is a session
 
 	// ponytail: one global lock and failure counter — single-user panel; per-IP
 	// counters would let an attacker rotate IPs, so global is the stricter choice.
@@ -243,6 +244,9 @@ func (a *auth) newSession(email string) string {
 
 // validSession checks the token belongs to the same Access identity and slides its idle expiry.
 func (a *auth) validSession(tok, email string) bool {
+	if a.gated {
+		return true
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s, ok := a.sessions[tok]
@@ -264,6 +268,9 @@ func (a *auth) validSession(tok, email string) bool {
 
 // peekSession checks validity without extending it: an open live stream is not user activity.
 func (a *auth) peekSession(tok, email string) bool {
+	if a.gated {
+		return true
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s, ok := a.sessions[tok]

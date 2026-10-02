@@ -36,6 +36,7 @@ type config struct {
 	pinFile, auditFile, ciDir, statusDir, home string
 	insecure                                   bool
 	embedLocal                                 bool
+	behindCube                                 bool // a Cube app: the gate in front has signed the visitor in
 }
 
 var teamRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
@@ -51,7 +52,10 @@ func validateConfig(c config) error {
 	if ip, err := netip.ParseAddr(host); err != nil || !ip.IsLoopback() {
 		return fmt.Errorf("-addr %s is not loopback: the panel must only be reachable through the tunnel", c.addr)
 	}
-	if c.insecure {
+	if c.behindCube && (c.cfTeam != "" || c.cfAUD != "") {
+		return errors.New("-behind-cube cannot be combined with -cf-team or -cf-aud: Cube's gate is the panel's sign-in")
+	}
+	if c.insecure || c.behindCube {
 		return nil
 	}
 	if !teamRe.MatchString(c.cfTeam) || c.cfAUD == "" {
@@ -124,9 +128,10 @@ func newServer(cfg config) *server {
 		uploadDir: filepath.Join(filepath.Dir(cfg.auditFile), "uploads"),
 		wake:      make(chan struct{}, 1),
 	}
-	if !cfg.insecure {
+	if !cfg.insecure && !cfg.behindCube {
 		s.access = newAccess(cfg.cfTeam, cfg.cfAUD)
 	}
+	s.auth.gated = cfg.behindCube
 	s.term.paused = func(key string) bool {
 		for _, l := range s.limits.list() {
 			if l.Key == key && l.Paused {
@@ -397,7 +402,7 @@ func (s *server) clientError(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) me(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"email": identity(r), "insecure": s.cfg.insecure})
+	writeJSON(w, 200, map[string]any{"email": identity(r), "insecure": s.cfg.insecure, "behindCube": s.cfg.behindCube})
 }
 
 // ---- actions ----
@@ -597,7 +602,7 @@ func (s *server) tick(now time.Time, st *sampleState) {
 	if now.Sub(st.secAt) >= 60*time.Second {
 		_, pinErr := os.Stat(s.cfg.pinFile)
 		st.sec = secScan(st.sock, procComm, secEnv{
-			home: s.cfg.home, ciDir: s.cfg.ciDir, panelAddr: s.cfg.addr,
+			home: s.cfg.home, ciDir: s.cfg.ciDir, panelAddr: s.cfg.addr, behindCube: s.cfg.behindCube,
 			accessOn: s.access != nil, pinSet: pinErr == nil, tunnelUp: commRunning("cloudflared"),
 			audit: s.audit, fails24h: s.auth.fails24h(), lockedFor: s.auth.lockedFor(),
 		})

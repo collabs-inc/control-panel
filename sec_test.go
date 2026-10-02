@@ -135,3 +135,25 @@ func TestSecScan(t *testing.T) {
 		}
 	}
 }
+
+// Behind Cube, the gate is the sign-in: no Access, PIN or tunnel check reports it as missing.
+func TestSecScanBehindCube(t *testing.T) {
+	s := secScan(sockScan{}, func(int) string { return "" }, secEnv{
+		home: t.TempDir(), panelAddr: "127.0.0.1:7777", behindCube: true, audit: openAudit(filepath.Join(t.TempDir(), "a.jsonl")),
+	})
+	levels := map[string]string{}
+	for _, c := range s.Checks {
+		levels[c.Title] = c.Level
+	}
+	if levels["Cube signs visitors in"] != "ok" || levels["Panel bound to localhost"] != "ok" {
+		t.Fatalf("checks = %+v", s.Checks)
+	}
+	for _, title := range []string{"Cloudflare Access enforced", "PIN set", "Tunnel running", "Failed PIN attempts (24 h)"} {
+		if _, ok := levels[title]; ok {
+			t.Errorf("%s reported behind Cube", title)
+		}
+	}
+	if s.Bad != 0 {
+		t.Errorf("bad = %d", s.Bad)
+	}
+}

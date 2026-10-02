@@ -2307,6 +2307,7 @@ function toast(msg, bad) {
 (async () => {
   try {
     const r = await api('/api/me');
+    $('#logout').hidden = !!r.behindCube; // behind Cube there is no PIN screen to lock to
     if (r.status === 200) startApp();
     else showLogin(r.status === 401 ? '' : r.error || '');
   } catch { showLogin('Network error — retrying…'); setTimeout(() => location.reload(), 5000); }

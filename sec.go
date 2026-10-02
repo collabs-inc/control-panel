@@ -63,6 +63,7 @@ type Security struct {
 type secEnv struct {
 	home, ciDir, panelAddr     string
 	accessOn, pinSet, tunnelUp bool
+	behindCube                 bool // Cube's gate signs visitors in: no Access, PIN or tunnel to check
 	audit                      *auditLog
 	fails24h                   int
 	lockedFor                  time.Duration
@@ -250,12 +251,18 @@ func secScan(sock sockScan, procName func(pid int) string, env secEnv) Security 
 			pubPorts = append(pubPorts, fmt.Sprintf("%s:%d (%s)", l.Addr, l.Port, orDash(l.Proc)))
 		}
 	}
-	add(env.accessOn, "ok", "bad", "Cloudflare Access enforced",
-		"every request must carry a valid Access token", "running with -insecure-no-access: anyone who reaches the port sees the PIN screen")
+	if env.behindCube {
+		s.Checks = append(s.Checks, Check{"ok", "Cube signs visitors in", "running with -behind-cube: every request passes Cube's gate first"})
+	} else {
+		add(env.accessOn, "ok", "bad", "Cloudflare Access enforced",
+			"every request must carry a valid Access token", "running with -insecure-no-access: anyone who reaches the port sees the PIN screen")
+	}
 	add(hostIP.IsLoopback(), "ok", "bad", "Panel bound to localhost",
 		env.panelAddr+" — reachable only through the tunnel", env.panelAddr+" is reachable from the network directly")
-	add(env.pinSet, "ok", "bad", "PIN set", "PIN hash in ~/.config/control-panel/pin", "run `control-panel set-pin` on the VM")
-	add(env.tunnelUp, "ok", "warn", "Tunnel running", "cloudflared is up", "cloudflared is not running: panel unreachable from outside")
+	if !env.behindCube {
+		add(env.pinSet, "ok", "bad", "PIN set", "PIN hash in ~/.config/control-panel/pin", "run `control-panel set-pin` on the VM")
+		add(env.tunnelUp, "ok", "warn", "Tunnel running", "cloudflared is up", "cloudflared is not running: panel unreachable from outside")
+	}
 	add(len(pubPorts) == 0, "ok", "warn", "Ports open beyond localhost",
 		"nothing listens on a public interface", strings.Join(pubPorts, ", ")+" — reachability is decided by the Cube/Fly edge")
 	add(len(s.Inbound) == 0, "ok", "warn", "Inbound public connections",
@@ -263,6 +270,7 @@ func secScan(sock sockScan, procName func(pid int) string, env secEnv) Security 
 	add(len(s.Loose) == 0, "ok", "warn", "World-readable secrets",
 		"credential files are private", fmt.Sprintf("%d file(s) readable by other users — chmod 600", len(s.Loose)))
 	switch {
+	case env.behindCube:
 	case env.lockedFor > 0:
 		s.Checks = append(s.Checks, Check{"bad", "Failed PIN attempts (24 h)", fmt.Sprintf("login locked for %s after repeated wrong PINs", env.lockedFor.Round(time.Second))})
 	case env.fails24h > 0:
