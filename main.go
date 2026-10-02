@@ -25,6 +25,7 @@ func main() {
 	fs.StringVar(&cfg.auditFile, "audit-file", filepath.Join(home, ".local/state/control-panel/audit.jsonl"), "audit log")
 	fs.StringVar(&cfg.ciDir, "ci-dir", filepath.Join(home, "projects/ci-cd-jobs"), "GitHub runner directories")
 	fs.StringVar(&cfg.statusDir, "status-dir", "/tmp/claude-tab-status", "claude-tab-status output")
+	fs.BoolVar(&cfg.embedLocal, "embed-local", false, "partition session cookies for embedding via localhost (requires -insecure-no-access)")
 	fs.BoolVar(&cfg.insecure, "insecure-no-access", false, "skip Cloudflare Access checks (local testing only)")
 
 	args := os.Args[1:]

@@ -29,17 +29,21 @@ Set a new PIN for this instance, then start the server in local mode:
 ```sh
 cd /workspace/home/repos/adrian-control-panel
 ./control-panel set-pin -pin-file "$PWD/.local-state/pin"
-./control-panel -insecure-no-access -addr 127.0.0.1:7777 \
-  -pin-file "$PWD/.local-state/pin" \
-  -audit-file "$PWD/.local-state/audit.jsonl"
+./run-local.sh
 ```
 
 The PIN prompt accepts 6–32 digits. Use your own PIN; no Adrian credentials
-are needed. The app binds to loopback. Local mode skips Cloudflare Access
-checks but retains the app's PIN authentication. In this explicit testing
-mode, session cookies work over HTTP. Cloudflare mode keeps HTTPS-only
-cookies. For access from another computer, forward port 7777 over
-SSH and open `http://localhost:7777` there.
+are needed. The app binds to loopback. The launcher enables local testing
+and `-embed-local`, which uses HttpOnly, Secure, SameSite=None, Partitioned
+session cookies. This lets Cube's embedded site frame keep its own login
+without depending on unpartitioned third-party cookies. Cross-site POST
+protection and PIN authentication remain enabled.
+
+Open it through Cube's forwarded loopback address or `http://localhost:7777`.
+Chromium accepts Secure cookies on loopback HTTP. For another computer,
+forward port 7777 over SSH and use localhost there. For plain HTTP through a
+non-loopback hostname, omit `-embed-local` when running the binary directly;
+that mode uses Strict cookies and is intended for a standalone browser tab.
 
 For a deployed HTTPS instance, configure your own Cloudflare Access team,
 application audience, and tunnel, then replace `-insecure-no-access` with

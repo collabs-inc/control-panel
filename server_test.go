@@ -677,3 +677,44 @@ func TestLocalHTTPLoginPersistsAndLogoutClearsSession(t *testing.T) {
 		t.Fatalf("session survived logout: %d", resp.StatusCode)
 	}
 }
+
+func TestEmbeddedLocalCookieAndCrossSiteProtection(t *testing.T) {
+	e := newTestServer(t)
+	e.s.cfg.insecure = true
+	e.s.cfg.embedLocal = true
+	e.s.access = nil
+	resp := e.do(t, "POST", "/api/login", `{"pin":"482913"}`, nil)
+	cookies := resp.Cookies()
+	if resp.StatusCode != 200 || len(cookies) != 1 {
+		t.Fatal("embedded login failed")
+	}
+	c := cookies[0]
+	if !c.Secure || !c.HttpOnly || !c.Partitioned || c.SameSite != http.SameSiteNoneMode {
+		t.Fatal("embedded cookie must be Secure, HttpOnly, SameSite=None, Partitioned")
+	}
+	token := c.Value
+	if r := e.do(t, "GET", "/api/me", "", map[string]string{"Cookie": "cp_session=stale-browser-cookie; cp_session_embed=" + token}); r.StatusCode != 200 {
+		t.Fatal("old browser cookie shadowed embedded login")
+	}
+	// PIN is still required, and cross-site writes remain blocked.
+	if r := e.do(t, "GET", "/api/me", "", nil); r.StatusCode != 401 {
+		t.Fatal("missing session accepted")
+	}
+	if r := e.do(t, "POST", "/api/login", `{"pin":"482913"}`, map[string]string{"Sec-Fetch-Site": "cross-site", "Origin": "https://untrusted.example"}); r.StatusCode != 403 {
+		t.Fatalf("cross-site login: %d", r.StatusCode)
+	}
+	if r := e.do(t, "POST", "/api/logout", `{}`, map[string]string{"Cookie": "cp_session_embed=" + token, "Sec-Fetch-Site": "cross-site"}); r.StatusCode != 403 {
+		t.Fatalf("cross-site write: %d", r.StatusCode)
+	}
+	resp = e.do(t, "POST", "/api/logout", `{}`, map[string]string{"Cookie": "cp_session_embed=" + token})
+	cookies = resp.Cookies()
+	if resp.StatusCode != 200 || len(cookies) != 1 || !cookies[0].Partitioned || !cookies[0].Secure || cookies[0].MaxAge != -1 {
+		t.Fatal("logout must clear the same partitioned cookie")
+	}
+	if r := e.do(t, "GET", "/api/me", "", map[string]string{"Cookie": "cp_session_embed=" + token}); r.StatusCode != 401 {
+		t.Fatal("session survived logout")
+	}
+	if err := validateConfig(config{addr: "127.0.0.1:7777", cfTeam: "team", cfAUD: "aud", embedLocal: true}); err == nil {
+		t.Fatal("embedded local mode must be explicitly local")
+	}
+}

@@ -130,7 +130,7 @@ func (s *server) screenStream(w http.ResponseWriter, r *http.Request, session st
 			}
 		}
 	}()
-	tok, email := sessionToken(r), identity(r)
+	tok, email := s.sessionToken(r), identity(r)
 	ping := time.NewTicker(pingEvery)
 	defer ping.Stop()
 	var last time.Time
@@ -213,7 +213,7 @@ func (s *server) chatStream(w http.ResponseWriter, r *http.Request, session stri
 		end = stop
 	}
 	reset()
-	tok, email := sessionToken(r), identity(r)
+	tok, email := s.sessionToken(r), identity(r)
 	tick, ping := time.NewTicker(time.Second), time.NewTicker(pingEvery)
 	defer tick.Stop()
 	defer ping.Stop()

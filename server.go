@@ -35,11 +35,15 @@ type config struct {
 	addr, cfTeam, cfAUD                        string
 	pinFile, auditFile, ciDir, statusDir, home string
 	insecure                                   bool
+	embedLocal                                 bool
 }
 
 var teamRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
 func validateConfig(c config) error {
+	if c.embedLocal && !c.insecure {
+		return errors.New("-embed-local requires -insecure-no-access")
+	}
 	host, _, err := net.SplitHostPort(c.addr)
 	if err != nil {
 		return fmt.Errorf("bad -addr: %v", err)
@@ -281,8 +285,15 @@ func (s *server) requireAccess(h http.Handler) http.Handler {
 	})
 }
 
-func sessionToken(r *http.Request) string {
-	c, err := r.Cookie("cp_session")
+func (s *server) sessionCookieName() string {
+	if s.cfg.embedLocal {
+		return "cp_session_embed"
+	}
+	return "cp_session"
+}
+
+func (s *server) sessionToken(r *http.Request) string {
+	c, err := r.Cookie(s.sessionCookieName())
 	if err != nil {
 		return ""
 	}
@@ -291,7 +302,7 @@ func sessionToken(r *http.Request) string {
 
 func (s *server) withSession(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !s.auth.validSession(sessionToken(r), identity(r)) {
+		if !s.auth.validSession(s.sessionToken(r), identity(r)) {
 			writeJSON(w, 401, map[string]any{"error": "login required", "retryIn": int(s.auth.lockedFor().Seconds())})
 			return
 		}
@@ -329,6 +340,20 @@ func (s *server) pinError(w http.ResponseWriter, err error) bool {
 
 // ---- auth endpoints ----
 
+// Embedded local panels have a cross-site top-level ancestor. Partition the
+// HttpOnly cookie by that ancestor instead of relying on third-party cookies.
+// Chromium accepts Secure cookies on localhost/loopback HTTP URLs.
+func (s *server) sessionCookie(r *http.Request, token string, maxAge int) *http.Cookie {
+	c := &http.Cookie{Name: s.sessionCookieName(), Value: token, Path: "/", HttpOnly: true,
+		Secure: !s.cfg.insecure || r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: maxAge}
+	if s.cfg.embedLocal {
+		c.Secure = true
+		c.SameSite = http.SameSiteNoneMode
+		c.Partitioned = true
+	}
+	return c
+}
+
 func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	var body struct{ PIN string }
 	readJSON(r, &body)
@@ -336,15 +361,14 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tok := s.auth.newSession(identity(r))
-	http.SetCookie(w, &http.Cookie{Name: "cp_session", Value: tok, Path: "/", HttpOnly: true,
-		Secure: !s.cfg.insecure || r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: int(sessionIdle.Seconds())})
+	http.SetCookie(w, s.sessionCookie(r, tok, int(sessionIdle.Seconds())))
 	s.audit.add("login", identity(r), clientIP(r))
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (s *server) logout(w http.ResponseWriter, r *http.Request) {
-	s.auth.endSession(sessionToken(r))
-	http.SetCookie(w, &http.Cookie{Name: "cp_session", Value: "", Path: "/", HttpOnly: true, Secure: !s.cfg.insecure || r.TLS != nil, SameSite: http.SameSiteStrictMode, MaxAge: -1})
+	s.auth.endSession(s.sessionToken(r))
+	http.SetCookie(w, s.sessionCookie(r, "", -1))
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -484,7 +508,7 @@ func (s *server) stream(w http.ResponseWriter, r *http.Request) {
 	case s.wake <- struct{}{}:
 	default:
 	}
-	tok, email := sessionToken(r), identity(r)
+	tok, email := s.sessionToken(r), identity(r)
 	ping := time.NewTicker(pingEvery)
 	defer ping.Stop()
 	for {
