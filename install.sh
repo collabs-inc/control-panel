@@ -1,5 +1,5 @@
 #!/bin/sh
-# Cube runs this in the app's folder after it installs or updates the panel: build the binary that cube-app.json starts.
+# Cube runs this in the app's folder after it installs or updates the panel: build the binary that cube.json starts.
 set -eu
 if ! command -v go >/dev/null 2>&1; then
   toolchain="$HOME/.local/share/control-panel-toolchain/go/bin"

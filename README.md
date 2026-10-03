@@ -53,7 +53,7 @@ it is preserved as source, not configured to run on this Cube.
 
 ## Run as a Cube app
 
-`cube-app.json` makes this repository a Cube app: Cube clones it, runs
+`cube.json` makes this repository a Cube app: Cube clones it, runs
 `install.sh` (which builds the binary with Go from `PATH`, or from
 `~/.local/share/control-panel-toolchain/go/bin`), and starts
 `./control-panel -behind-cube -addr 127.0.0.1:$PORT`. With `-behind-cube`,
