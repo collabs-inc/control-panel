@@ -1,22 +1,36 @@
-# Adrian's control panel
+# Control Panel
 
-A source snapshot of Adrian Zabica's Go and JavaScript control panel, copied
-with the permission relayed by the Cube team on October 2, 2026.
+A Linux control panel for machine resources, terminals, Claude sessions,
+CI runners, and security. Built by **Adrian Zabica** in Go and JavaScript,
+with integration by the [Cube Computer](https://cube.computer) team.
 
-The source came from `/workspace/home/projects/control-panel` on his Cube.
-The snapshot includes the Go backend, frontend, tests, and helper scripts.
-It excludes his compiled binary, `panel.env`, runtime directory, PIN,
-Cloudflare credentials, and other account data. This is a local checkout;
-nothing has been published.
+This repository preserves Adrian's source and the Cube integration work.
+The source was shared with permission relayed by the Cube team on
+October 2, 2026. It contains no instance configuration or account data.
 
-## Build and test on this Cube
+## Install in Cube
 
-Go 1.27.1 is installed in a dedicated directory on this Cube. Its downloaded
-archive was checked against the SHA-256 hash published by go.dev.
+In **Market**, choose **Add app from repo** and enter:
+
+```text
+https://github.com/collabs-inc/control-panel
+```
+
+The app runs on Linux. Install Go 1.27.1 or later on your Cube before
+installing the app; `install.sh` builds the server using Go from `PATH`
+or `~/.local/share/control-panel-toolchain/go/bin`. Terminal features
+also require Zellij (tested with 0.45.1) on `PATH` or in `~/.local/bin`.
+
+Cube reads `cube.json`, builds the app, and opens it using Cube's sign-in.
+
+## Build and test
+
+Requires Linux and Go 1.27.1 or later. Node.js is needed only for the
+JavaScript tests; the frontend has no build step.
 
 ```sh
-cd /workspace/home/repos/adrian-control-panel
-export PATH="/workspace/home/.local/share/control-panel-toolchain/go/bin:$PATH"
+git clone https://github.com/collabs-inc/control-panel.git
+cd control-panel
 go test ./...
 node --test lib_test.js
 go build -o control-panel .
@@ -27,7 +41,6 @@ go build -o control-panel .
 Set a new PIN for this instance, then start the server in local mode:
 
 ```sh
-cd /workspace/home/repos/adrian-control-panel
 ./control-panel set-pin -pin-file "$PWD/.local-state/pin"
 ./run-local.sh
 ```
@@ -70,7 +83,7 @@ outside the app's folder, so an update keeps it.
 ## Integration dependencies
 
 The system views use Linux `/proc` and utilities such as `du`, `nice`, and
-`ionice`. Zellij 0.45.1 is installed at `~/.local/bin/zellij`. Terminal controls
+`ionice`. Install Zellij separately for terminal controls, which
 create and use their own Zellij sessions; they do not automatically expose
 Cube's ptyd terminals. Claude views expect the local user's Claude session
 files. CI views expect runner directories under `~/projects/ci-cd-jobs`,
@@ -79,12 +92,3 @@ which you can change with `-ci-dir`; GitHub title lookup uses `gh`.
 The application reads the home directory of the user running it. Run it
 as your normal Cube user. It includes process, terminal, and cleanup actions
 that operate on this Cube once you use them.
-
-## Local instance status
-
-The instance was started on October 2, 2026, on `127.0.0.1:7777`.
-Its PID and log are in `.local-state/server.pid` and `.local-state/server.log`.
-The configured PIN hash is in `.local-state/pin`; runtime files are ignored by
-Git. The server is a background process, not a service configured for restart.
-Browser login and creation of the `control-panel-demo` Zellij session were
-verified on this Cube.
