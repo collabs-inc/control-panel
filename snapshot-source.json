@@ -1,0 +1,11 @@
+{
+  "capturedDate": "2026-10-20",
+  "sourceMachine": "2872d9dc4d9698",
+  "sourcePath": "/workspace/home/projects/control-panel",
+  "sourceHead": "600865b47e16cf5e45c883416dd03a9b6c9b3cfa",
+  "includesUncommitted": true,
+  "excluded": [
+    "panel.env",
+    "ignored runtime files and binaries"
+  ]
+}

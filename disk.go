@@ -173,10 +173,7 @@ func (x *duIndex) save() {
 	if err != nil || os.MkdirAll(filepath.Dir(x.file), 0o700) != nil {
 		return
 	}
-	tmp := x.file + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) == nil {
-		os.Rename(tmp, x.file)
-	}
+	writeFileAtomic(x.file, b, 0o600)
 }
 
 func (x *duIndex) load() {
@@ -353,16 +350,8 @@ type deleteGuard struct {
 	ciDir   string
 }
 
-func (x *duIndex) checkDelete(p string, g deleteGuard) error {
-	if !filepath.IsAbs(p) || filepath.Clean(p) != p {
-		return errors.New("not a clean absolute path")
-	}
-	if !strings.HasPrefix(p, x.root+"/") {
-		return fmt.Errorf("only paths inside %s", tilde(x.root))
-	}
-	if real, err := filepath.EvalSymlinks(filepath.Dir(p)); err != nil || real != filepath.Dir(p) {
-		return errors.New("the path goes through a symlinked folder")
-	}
+// protected refuses a path that is, holds or sits in something the panel, its tunnel, SSH, Claude or a CI runner needs.
+func (g deleteGuard) protected(p string) error {
 	for _, q := range g.protect {
 		if p == q || strings.HasPrefix(q, p+"/") || strings.HasPrefix(p, q+"/") {
 			return fmt.Errorf("%s is protected: the panel, its tunnel, SSH or Claude need it", tilde(q))
@@ -373,6 +362,22 @@ func (x *duIndex) checkDelete(p string, g deleteGuard) error {
 		if p == g.ciDir || strings.HasPrefix(g.ciDir, p+"/") || len(parts) < 2 || (parts[1] != "_work" && parts[1] != "_diag") {
 			return errors.New("CI runners need their own files: only a runner's _work and _diag can be cleaned")
 		}
+	}
+	return nil
+}
+
+func (x *duIndex) checkDelete(p string, g deleteGuard) error {
+	if !filepath.IsAbs(p) || filepath.Clean(p) != p {
+		return errors.New("not a clean absolute path")
+	}
+	if !strings.HasPrefix(p, x.root+"/") {
+		return fmt.Errorf("only paths inside %s", tilde(x.root))
+	}
+	if real, err := filepath.EvalSymlinks(filepath.Dir(p)); err != nil || real != filepath.Dir(p) {
+		return errors.New("the path goes through a symlinked folder")
+	}
+	if err := g.protected(p); err != nil {
+		return err
 	}
 	if _, err := os.Lstat(p); err != nil {
 		return errors.New("nothing at that path")
@@ -474,6 +479,18 @@ func (s *server) deleteGuard() deleteGuard {
 	}}
 	if exe, err := os.Executable(); err == nil {
 		g.protect = append(g.protect, filepath.Dir(exe)) // the panel's own folder: ensure-panel.sh rebuilds from it
+	}
+	real := func(p string) string { // Files checks resolved paths: a symlinked home must still match
+		if r, err := filepath.EvalSymlinks(p); err == nil {
+			return r
+		}
+		return p
+	}
+	for i, p := range g.protect {
+		g.protect[i] = real(p)
+	}
+	if g.ciDir != "" {
+		g.ciDir = real(g.ciDir)
 	}
 	return g
 }

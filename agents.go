@@ -41,8 +41,7 @@ type Agents struct {
 }
 
 type agentsTracker struct {
-	dir     string // claude-tab-status output
-	sockDir string // zellij session sockets: a session is live iff its socket exists
+	dir string // claude-tab-status output
 }
 
 var sessionNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)

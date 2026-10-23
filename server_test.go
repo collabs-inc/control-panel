@@ -7,11 +7,11 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"syscall"
@@ -108,11 +108,38 @@ func TestPageServedWithSecurityHeaders(t *testing.T) {
 		t.Fatalf("status %d body %.200s", r.StatusCode, body)
 	}
 	csp := r.Header.Get("Content-Security-Policy")
-	if !strings.Contains(csp, "default-src 'self'") || !strings.Contains(csp, "frame-ancestors 'none'") || strings.Contains(csp, "unsafe-inline") {
+	// scripts only from the panel itself (default-src); inline styles allowed for Mermaid's diagrams, nothing else inline
+	if !strings.Contains(csp, "default-src 'self'") || !strings.Contains(csp, "frame-ancestors 'none'") || strings.Contains(csp, "script-src") ||
+		strings.Count(csp, "unsafe-inline") != 1 || !strings.Contains(csp, "style-src 'self' 'unsafe-inline'") {
 		t.Fatalf("CSP = %q", csp)
 	}
 	if r.Header.Get("X-Content-Type-Options") != "nosniff" || r.Header.Get("Referrer-Policy") != "no-referrer" {
 		t.Fatalf("headers = %v", r.Header)
+	}
+}
+
+// A launch revalidates the page instead of downloading it again; any asset's change makes it new.
+func TestPageRevalidatesWithItsVersion(t *testing.T) {
+	e := newTestServer(t)
+	hdr := map[string]string{"Cf-Access-Jwt-Assertion": e.jwt, "Accept-Encoding": "gzip"}
+	r := e.do(t, "GET", "/", "", hdr)
+	tag := r.Header.Get("ETag")
+	if r.StatusCode != 200 || tag != `W/"`+e.s.version+`"` || r.Header.Get("Content-Encoding") != "gzip" || r.Header.Get("Cache-Control") != "no-cache" {
+		t.Fatalf("first load: %d %v", r.StatusCode, r.Header)
+	}
+	hdr["If-None-Match"] = tag
+	r = e.do(t, "GET", "/", "", hdr)
+	if body, _ := io.ReadAll(r.Body); r.StatusCode != 304 || len(body) != 0 {
+		t.Fatalf("revalidate: %d %d bytes", r.StatusCode, len(body))
+	}
+	hdr["If-None-Match"] = `W/"older"`
+	if r := e.do(t, "GET", "/", "", hdr); r.StatusCode != 200 {
+		t.Fatalf("another build: %d", r.StatusCode)
+	}
+	a := e.s.assets["app.js"]
+	hdr["If-None-Match"] = `W/"` + a.hash + `"`
+	if r := e.do(t, "GET", "/app.js?v="+a.hash, "", hdr); r.StatusCode != 304 || !strings.Contains(r.Header.Get("Cache-Control"), "immutable") {
+		t.Fatalf("asset revalidate: %d %v", r.StatusCode, r.Header)
 	}
 }
 
@@ -285,7 +312,7 @@ func TestPaneInputValidatesAndAudits(t *testing.T) {
 		{`{"session":"../x","pane":3,"text":"hi"}`, "bad session"},
 		{`{"session":"dev-1","pane":-1,"text":"hi"}`, "negative pane"},
 		{`{"session":"dev-1","pane":3,"keys":["rm -rf"]}`, "key not allowed"},
-		{`{"session":"dev-1","pane":3,"text":"` + strings.Repeat("x", 17000) + `"}`, "text too long"},
+		{`{"session":"dev-1","pane":3,"text":"` + strings.Repeat("x", maxPaste+1) + `"}`, "text too long"},
 		{`{"session":"dev-1","pane":3}`, "nothing to send"},
 	}
 	for _, b := range bad {
@@ -298,6 +325,11 @@ func TestPaneInputValidatesAndAudits(t *testing.T) {
 	}
 	if len(f.calls) != 1 || f.calls[0][3] != "list-panes" {
 		t.Fatalf("zellij called for invalid input: %v", f.calls)
+	}
+	f.calls = nil
+	long := strings.Repeat("line of a long paste\\n", maxPaste/22) // JSON-escaped newlines: the body is bigger than the text
+	if r := e.do(t, "POST", "/api/pane/input", `{"session":"dev-1","pane":3,"text":"`+long+`"}`, h); r.StatusCode != 200 {
+		t.Fatalf("a paste just under %d bytes: %d", maxPaste, r.StatusCode)
 	}
 	f.calls = nil
 	if r := e.do(t, "POST", "/api/pane/input", `{"session":"dev-1","pane":3,"text":"run the tests","enter":true,"keys":["Esc"]}`, h); r.StatusCode != 200 {
@@ -363,7 +395,7 @@ func TestTermNew(t *testing.T) {
 	}
 	want := []string{
 		"--session dev-1 action new-pane --tab-id 2 --no-focus --cwd " + cwd + " --name logs --direction down",
-		"--session dev-1 action write-chars --pane-id terminal_7 -- claude",
+		"--session dev-1 action write-chars --pane-id terminal_7 -- claude-multi",
 		"--session dev-1 action send-keys --pane-id terminal_7 Enter",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
@@ -399,8 +431,13 @@ func TestPaneInputChooseReadsTheScreenFirst(t *testing.T) {
 	if r := e.do(t, "POST", "/api/pane/input", `{"session":"dev-1","pane":5,"choose":"Yes, I trust this folder","sig":"`+sig+`"}`, h); r.StatusCode != 200 {
 		t.Fatalf("choose: %d", r.StatusCode)
 	}
-	last := f.calls[len(f.calls)-1]
-	if strings.Join(last, " ") != "--session dev-1 action send-keys --pane-id terminal_5 Down Enter" {
+	sent := ""
+	for _, c := range f.calls {
+		if j := strings.Join(c, " "); strings.Contains(j, "send-keys") {
+			sent = j
+		}
+	}
+	if sent != "--session dev-1 action send-keys --pane-id terminal_5 Down Enter" {
 		t.Fatalf("calls = %v", f.calls)
 	}
 	if r := e.do(t, "POST", "/api/pane/input", `{"session":"dev-1","pane":5,"choose":"Something else","sig":"`+sig+`"}`, h); r.StatusCode != 409 {
@@ -630,192 +667,159 @@ func TestClientErrorsAreLoggedWithTheBrowser(t *testing.T) {
 	}
 }
 
-// Local HTTP clients must retain the session after successfully entering a PIN.
-func TestLocalHTTPLoginPersistsAndLogoutClearsSession(t *testing.T) {
+func TestPaneInputAnswersWithFreeText(t *testing.T) {
 	e := newTestServer(t)
-	e.s.cfg.insecure = true
-	e.s.access = nil
-	jar, _ := cookiejar.New(nil)
-	client := &http.Client{Jar: jar}
-	resp, err := client.Post(e.srv.URL+"/api/login", "application/json", strings.NewReader(`{"pin":"482913"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("login: %d", resp.StatusCode)
-	}
-	cookies := resp.Cookies()
-	if len(cookies) != 1 || cookies[0].Secure || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
-		t.Fatal("local HTTP cookie flags incorrect")
-	}
-	resp, err = client.Get(e.srv.URL + "/api/me")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("session lost after login: %d", resp.StatusCode)
-	}
-	resp, err = client.Post(e.srv.URL+"/api/logout", "application/json", strings.NewReader(`{}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		t.Fatalf("logout: %d", resp.StatusCode)
-	}
-	if len(jar.Cookies(resp.Request.URL)) != 0 {
-		t.Fatal("logout did not clear cookie")
-	}
-	resp, err = client.Get(e.srv.URL + "/api/me")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 401 {
-		t.Fatalf("session survived logout: %d", resp.StatusCode)
-	}
-}
-
-func TestEmbeddedLocalCookieAndCrossSiteProtection(t *testing.T) {
-	e := newTestServer(t)
-	e.s.cfg.insecure = true
-	e.s.cfg.embedLocal = true
-	e.s.access = nil
-	resp := e.do(t, "POST", "/api/login", `{"pin":"482913"}`, nil)
-	cookies := resp.Cookies()
-	if resp.StatusCode != 200 || len(cookies) != 1 {
-		t.Fatal("embedded login failed")
-	}
-	c := cookies[0]
-	if !c.Secure || !c.HttpOnly || !c.Partitioned || c.SameSite != http.SameSiteNoneMode {
-		t.Fatal("embedded cookie must be Secure, HttpOnly, SameSite=None, Partitioned")
-	}
-	token := c.Value
-	if r := e.do(t, "GET", "/api/me", "", map[string]string{"Cookie": "cp_session=stale-browser-cookie; cp_session_embed=" + token}); r.StatusCode != 200 {
-		t.Fatal("old browser cookie shadowed embedded login")
-	}
-	// PIN is still required, and cross-site writes remain blocked.
-	if r := e.do(t, "GET", "/api/me", "", nil); r.StatusCode != 401 {
-		t.Fatal("missing session accepted")
-	}
-	if r := e.do(t, "POST", "/api/login", `{"pin":"482913"}`, map[string]string{"Sec-Fetch-Site": "cross-site", "Origin": "https://untrusted.example"}); r.StatusCode != 403 {
-		t.Fatalf("cross-site login: %d", r.StatusCode)
-	}
-	if r := e.do(t, "POST", "/api/logout", `{}`, map[string]string{"Cookie": "cp_session_embed=" + token, "Sec-Fetch-Site": "cross-site"}); r.StatusCode != 403 {
-		t.Fatalf("cross-site write: %d", r.StatusCode)
-	}
-	resp = e.do(t, "POST", "/api/logout", `{}`, map[string]string{"Cookie": "cp_session_embed=" + token})
-	cookies = resp.Cookies()
-	if resp.StatusCode != 200 || len(cookies) != 1 || !cookies[0].Partitioned || !cookies[0].Secure || cookies[0].MaxAge != -1 {
-		t.Fatal("logout must clear the same partitioned cookie")
-	}
-	if r := e.do(t, "GET", "/api/me", "", map[string]string{"Cookie": "cp_session_embed=" + token}); r.StatusCode != 401 {
-		t.Fatal("session survived logout")
-	}
-	if err := validateConfig(config{addr: "127.0.0.1:7777", cfTeam: "team", cfAUD: "aud", embedLocal: true}); err == nil {
-		t.Fatal("embedded local mode must be explicitly local")
-	}
-}
-
-// newLocalServer is a panel with no Cloudflare Access: -behind-cube when behindCube, else -insecure-no-access.
-// No PIN file exists, so the only way in is the mode itself.
-func newLocalServer(t *testing.T, behindCube bool) *testEnv {
-	t.Helper()
-	dir := t.TempDir()
-	s := newServer(config{
-		addr: "127.0.0.1:0", pinFile: filepath.Join(dir, "pin"), auditFile: filepath.Join(dir, "audit.jsonl"),
-		ciDir: filepath.Join(dir, "ci"), statusDir: filepath.Join(dir, "status"), home: dir,
-		insecure: !behindCube, behindCube: behindCube,
+	h := e.authed(e.login(t))
+	f := e.fakeZ(map[string]string{
+		"--session dev-1 action list-panes":  `[{"id":5,"title":"a","tab_id":0}]`,
+		"--session dev-1 action dump-screen": askTabsScreen,
 	})
-	if s.access != nil {
-		t.Fatal("a local panel checks Cloudflare Access")
+	sig := parsePrompt(askTabsScreen).Sig
+	if r := e.do(t, "POST", "/api/pane/input", `{"session":"dev-1","pane":5,"sig":"`+sig+`","answer":{"choose":"44","text":""}}`, h); r.StatusCode != 400 {
+		t.Fatalf("free text with nothing typed: %d", r.StatusCode)
 	}
-	s.sys.sockDir = filepath.Join(dir, "zellij-sockets") // never the real sessions
-	os.MkdirAll(s.sys.sockDir, 0o755)
-	z, _ := newFakeZellij(nil)
-	s.z, s.term.z = z, z
-	ts := httptest.NewServer(s.handler())
-	t.Cleanup(ts.Close)
-	return &testEnv{srv: ts, s: s, audit: filepath.Join(dir, "audit.jsonl")}
+	if r := e.do(t, "POST", "/api/pane/input", `{"session":"dev-1","pane":5,"sig":"`+sig+`","answer":{"choose":"44","text":"Yardi"}}`, h); r.StatusCode != 200 {
+		t.Fatalf("answer: %d", r.StatusCode)
+	}
+	var sent []string
+	for _, c := range f.calls {
+		if j := strings.Join(c[2:], " "); strings.HasPrefix(j, "action send-keys") || strings.HasPrefix(j, "action paste") {
+			sent = append(sent, j)
+		}
+	}
+	want := []string{"action send-keys --pane-id terminal_5 Ctrl u", "action paste --pane-id terminal_5 -- Yardi", "action send-keys --pane-id terminal_5 Enter"}
+	if !reflect.DeepEqual(sent, want) {
+		t.Fatalf("sent = %q", sent)
+	}
 }
 
-// Behind Cube, the gate has signed the visitor in before the request arrives: no PIN, no Access, no cookie.
-func TestBehindCubeTreatsEveryRequestAsSession(t *testing.T) {
-	e := newLocalServer(t, true)
-	r := e.do(t, "GET", "/api/me", "", nil)
-	var me struct{ BehindCube bool }
-	json.NewDecoder(r.Body).Decode(&me)
-	if r.StatusCode != 200 || !me.BehindCube {
-		t.Fatalf("/api/me with no cookie: %d %+v", r.StatusCode, me)
+func TestAMessageIsNeverPastedOnTopOfWhatClaudesBoxHolds(t *testing.T) {
+	e := newTestServer(t)
+	h := e.authed(e.login(t))
+	transcript := filepath.Join(t.TempDir(), "s.jsonl")
+	os.WriteFile(transcript, []byte(`{"type":"user","timestamp":"2026-10-09T04:36:29Z","message":{"content":"Also, every page says Could not load"}}`+"\n"), 0o600)
+	e.s.term.mu.Lock()
+	e.s.term.last = Terminals{Sessions: []TSession{{Name: "dev-1", Tabs: []TTab{{Panes: []TPane{{ID: 5, Agent: &TAgent{Chat: true, path: transcript}}}}}}}}
+	e.s.term.mu.Unlock()
+	screen := func(box string) string {
+		return "● Stopped\n────────────\n❯ " + box + "\n────────────\n  [Opus 5.5] 📁 app\n"
 	}
-	if r := e.do(t, "GET", "/", "", nil); r.StatusCode != 200 {
-		t.Fatalf("page: %d", r.StatusCode)
-	}
-	// The stream outlives a ping: its session check must not end it.
-	pingEvery = 50 * time.Millisecond
-	defer func() { pingEvery = 15 * time.Second }()
-	req, _ := http.NewRequest("GET", e.srv.URL+"/api/stream?view=sec", nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "text/event-stream" {
-		t.Fatalf("stream: %d %q", resp.StatusCode, resp.Header.Get("Content-Type"))
-	}
-	pings := make(chan struct{})
-	go func() {
-		sc := bufio.NewScanner(resp.Body)
-		n := 0
-		for sc.Scan() {
-			if sc.Text() == ": ping" {
-				if n++; n == 3 {
-					close(pings)
-					return
-				}
+	f := e.fakeZ(map[string]string{
+		"--session dev-1 action list-panes":  `[{"id":5,"title":"a","tab_id":0}]`,
+		"--session dev-1 action dump-screen": screen("Tell me when V680 is live in production"),
+	})
+	pasted := func() bool {
+		for _, c := range f.calls {
+			if strings.Contains(strings.Join(c, " "), "paste") {
+				return true
 			}
 		}
-	}()
-	select {
-	case <-pings:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the stream ended or never pinged")
+		return false
 	}
-	// Cross-origin protection still applies; a same-origin action is let through to the handler.
-	if r := e.do(t, "POST", "/api/action/kill", `{"pid":999999}`, map[string]string{"Sec-Fetch-Site": "cross-site"}); r.StatusCode != 403 {
-		t.Fatalf("cross-site action: %d", r.StatusCode)
+	// a prompt Claude Code suggests shows in the box like typed text, but it was never sent: no reason to hold
+	if r := e.do(t, "POST", "/api/pane/input", `{"session":"dev-1","pane":5,"text":"What is the status now?","enter":true}`, h); r.StatusCode != 200 || !pasted() {
+		t.Fatalf("held over a suggestion: %d", r.StatusCode)
 	}
-	host := strings.TrimPrefix(e.srv.URL, "http://")
-	if r := e.do(t, "POST", "/api/action/kill", `{"pid":999999}`, map[string]string{"Origin": "http://evil.example"}); r.StatusCode != 403 {
-		t.Fatalf("cross-origin action: %d", r.StatusCode)
+	// the message it was stopped on, put back in its box: held
+	f.calls, f.answers["--session dev-1 action dump-screen"] = nil, screen("Also, every page says Could not load")
+	r := e.do(t, "POST", "/api/pane/input", `{"session":"dev-1","pane":5,"text":"Continue.","enter":true}`, h)
+	var got struct{ Error, Box string }
+	json.NewDecoder(r.Body).Decode(&got)
+	if r.StatusCode != 409 || got.Box != "Also, every page says Could not load" || pasted() {
+		t.Fatalf("held message: %d %+v", r.StatusCode, got)
 	}
-	if r := e.do(t, "POST", "/api/action/kill", `{"pid":999999}`, map[string]string{"Origin": "http://" + host}); r.StatusCode != 400 {
-		t.Fatalf("same-origin action: %d", r.StatusCode)
-	}
-}
-
-func TestWithoutBehindCubeASessionIsStillRequired(t *testing.T) {
-	e := newLocalServer(t, false)
-	for _, p := range []string{"/api/me", "/api/stream?view=res"} {
-		if r := e.do(t, "GET", p, "", nil); r.StatusCode != 401 {
-			t.Errorf("GET %s with no cookie: %d", p, r.StatusCode)
+	f.onCall = func(args []string) { // the box empties once Ctrl+U goes in
+		if strings.Contains(strings.Join(args, " "), "Ctrl u") {
+			f.answers["--session dev-1 action dump-screen"] = screen("")
 		}
 	}
+	if r := e.do(t, "POST", "/api/pane/input", `{"session":"dev-1","pane":5,"text":"Continue.","enter":true,"clear":true}`, h); r.StatusCode != 200 {
+		t.Fatalf("clear and send: %d", r.StatusCode)
+	}
+	var order []string
+	for _, c := range f.calls {
+		j := strings.Join(c, " ")
+		if strings.Contains(j, "Ctrl u") {
+			order = append(order, "clear")
+		} else if strings.Contains(j, "paste") {
+			order = append(order, "paste")
+		}
+	}
+	if strings.Join(order, ",") != "clear,paste" {
+		t.Fatalf("order = %v", order)
+	}
 }
 
-func TestBehindCubeConfig(t *testing.T) {
-	if err := validateConfig(config{addr: "127.0.0.1:7777", behindCube: true}); err != nil {
-		t.Error(err)
+// Claude Code reads a pasted photo in the background and drops an Enter that comes meanwhile; it attaches only
+// a path pasted as a piece of its own. The fake pane plays it: photos land, the first Enter is lost.
+func TestAMessageWithPhotosGoesInAndIsCheckedSent(t *testing.T) {
+	e := newTestServer(t)
+	h := e.authed(e.login(t))
+	e.s.term.mu.Lock()
+	e.s.term.last = Terminals{Sessions: []TSession{{Name: "dev-1", Tabs: []TTab{{Panes: []TPane{{ID: 5, Kind: "claude", Agent: &TAgent{}}}}}}}}
+	e.s.term.mu.Unlock()
+	a, b := filepath.Join(e.s.uploadDir, "20261011-000639-4f9b7d19d66e8f2f-a.png"), filepath.Join(e.s.uploadDir, "20261011-000722-bb852e85adfdba27-b.png")
+	box, enters, takes := "", 0, 2
+	screen := func() string {
+		return "● Done\n────────────\n❯ " + box + "\n────────────\n  [Opus 5.5] 📁 app\n"
 	}
-	if err := validateConfig(config{addr: "0.0.0.0:7777", behindCube: true}); err == nil {
-		t.Error("-behind-cube on 0.0.0.0 accepted")
+	f := e.fakeZ(map[string]string{"--session dev-1 action list-panes": `[{"id":5,"title":"a","tab_id":0}]`})
+	var sent []string
+	f.onCall = func(args []string) {
+		j := strings.Join(args[2:], " ")
+		switch {
+		case strings.HasPrefix(j, "action paste"):
+			sent = append(sent, args[len(args)-1])
+			if p := args[len(args)-1]; p == a+" "+b {
+				box += "[Image #1] [Image #2]"
+			} else {
+				box += p
+			}
+		case strings.HasSuffix(j, "Enter"):
+			sent = append(sent, "⏎")
+			if enters++; enters == takes {
+				box = ""
+			}
+		case strings.Contains(j, "Ctrl u"):
+			box = ""
+		}
+		f.answers["--session dev-1 action dump-screen"] = screen()
 	}
-	if err := validateConfig(config{addr: "127.0.0.1:7777", behindCube: true, cfTeam: "my-team", cfAUD: "abc"}); err == nil {
-		t.Error("-behind-cube with -cf-team accepted")
+	f.answers["--session dev-1 action dump-screen"] = screen()
+	body := `{"session":"dev-1","pane":5,"text":"` + a + ` ` + b + ` Can you check the KPIs?","enter":true}`
+	if r := e.do(t, "POST", "/api/pane/input", body, h); r.StatusCode != 200 {
+		t.Fatalf("send: %d", r.StatusCode)
 	}
-	if err := validateConfig(config{addr: "127.0.0.1:7777", behindCube: true, cfTeam: "my-team"}); err == nil {
-		t.Error("-behind-cube with -cf-team alone accepted")
+	if got := strings.Join(sent, " | "); got != a+" "+b+" |  Can you check the KPIs? | ⏎ | ⏎" {
+		t.Fatalf("typed: %s, want the photos alone, then the text, then Enter again when the first didn't take", got)
+	}
+	if l, _ := os.ReadFile(e.audit); !strings.Contains(string(l), "Enter again") {
+		t.Fatalf("audit: %s", l)
+	}
+	sent, enters, takes = nil, 0, 99 // it never takes: the message comes out of the box, and the page hears so
+	r := e.do(t, "POST", "/api/pane/input", `{"session":"dev-1","pane":5,"text":"Can you check the KPIs?","enter":true}`, h)
+	if r.StatusCode != 409 || box != "" || enters != 2 {
+		t.Fatalf("never taken: %d, box %q, %d Enters", r.StatusCode, box, enters)
+	}
+}
+
+// A frame a slow page couldn't take comes on a later tick, even when the state hasn't changed since.
+func TestClientGetsTheFrameItWasTooSlowFor(t *testing.T) {
+	c := &client{view: "sec", ch: make(chan []byte, 1)}
+	c.ch <- []byte("backlog") // the page hasn't read the last one yet
+	c.send([]byte("state"))   // dropped
+	<-c.ch
+	c.send([]byte("state")) // the same state, next tick
+	select {
+	case got := <-c.ch:
+		if string(got) != "state" {
+			t.Fatalf("got %q", got)
+		}
+	default:
+		t.Fatal("the frame it missed never came")
+	}
+	c.send([]byte("state")) // already has it
+	if len(c.ch) != 0 {
+		t.Fatal("an unchanged frame was sent twice")
 	}
 }

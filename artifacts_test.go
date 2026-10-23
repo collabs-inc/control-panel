@@ -134,3 +134,59 @@ func TestArtifactsIncludeDocumentsAMessageHandsOver(t *testing.T) {
 		t.Fatalf("artifacts = %+v", got)
 	}
 }
+
+// A session's HTML page keeps review comments beside it; other files and paths can't be written.
+func TestHTMLPageCommentsRoundTrip(t *testing.T) {
+	e := newTestServer(t)
+	h := e.authed(e.login(t))
+	transcript, tree, _ := artifactFixture(t)
+	page := filepath.Join(tree, "page.html")
+	os.WriteFile(page, []byte("<p>hi</p>"), 0o644)
+	f, _ := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0)
+	f.WriteString(toolLine("2026-09-30T03:00:00Z", "Write", `{"file_path":"`+page+`","content":"x"}`) + "\n")
+	f.Close()
+	e.s.term.mu.Lock()
+	e.s.term.last = Terminals{Sessions: []TSession{{Name: "dev-1", Tabs: []TTab{{Panes: []TPane{{ID: 3,
+		Agent: &TAgent{Chat: true, sid: "aaaaaaaa-0001", path: transcript}, Git: &GitInfo{Root: tree, Branch: "feat/x"}}}}}}}}
+	e.s.term.mu.Unlock()
+	url := "/api/pane/file/comments?session=dev-1&pane=3&path=" + page
+	var got struct{ Comments []map[string]any }
+	r := e.do(t, "GET", url, "", h)
+	json.NewDecoder(r.Body).Decode(&got)
+	if r.StatusCode != 200 || got.Comments == nil || len(got.Comments) != 0 {
+		t.Fatalf("empty load: %d %+v", r.StatusCode, got)
+	}
+	if r := e.do(t, "POST", url, `{"comments":[{"id":"a","text":"fix this"}]}`, h); r.StatusCode != 200 {
+		t.Fatalf("save: %d", r.StatusCode)
+	}
+	r = e.do(t, "GET", url, "", h)
+	json.NewDecoder(r.Body).Decode(&got)
+	if len(got.Comments) != 1 || got.Comments[0]["text"] != "fix this" {
+		t.Fatalf("reload: %+v", got)
+	}
+	if _, err := os.Stat(page + ".comments.json"); err != nil {
+		t.Fatalf("comments file beside the page: %v", err)
+	}
+	md := filepath.Join(tree, "docs", "report.md")
+	for _, p := range []string{md, "/etc/passwd.html"} {
+		if r := e.do(t, "POST", "/api/pane/file/comments?session=dev-1&pane=3&path="+p, `{"comments":[]}`, h); r.StatusCode != 404 {
+			t.Errorf("%s: %d (only the session's own HTML pages)", p, r.StatusCode)
+		}
+	}
+	if r := e.do(t, "POST", url, `{"nope":1}`, h); r.StatusCode != 400 {
+		t.Errorf("malformed body: %d", r.StatusCode)
+	}
+	// a link planted at the temp file's name (a cloned repo can carry one) is never written through
+	victim := filepath.Join(tree, "victim")
+	os.WriteFile(victim, []byte("keep"), 0o644)
+	os.Symlink(victim, page+".comments.json.tmp")
+	if r := e.do(t, "POST", url, `{"comments":[{"id":"b","text":"again"}]}`, h); r.StatusCode != 200 {
+		t.Fatalf("save beside a planted link: %d", r.StatusCode)
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "keep" {
+		t.Fatalf("written through the planted link: %q", b)
+	}
+	if fi, err := os.Lstat(page + ".comments.json"); err != nil || !fi.Mode().IsRegular() || fi.Mode().Perm() != 0o644 {
+		t.Fatalf("comments file: %v %v", fi, err)
+	}
+}

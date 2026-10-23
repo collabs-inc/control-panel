@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // zellij drives the zellij CLI. Every call makes the zellij server re-broadcast its state to
@@ -89,6 +90,10 @@ type zPane struct {
 	TabID      int    `json:"tab_id"`
 	TabPos     int    `json:"tab_position"`
 	TabName    string `json:"tab_name"`
+	X          int    `json:"pane_x"` // where it sits in its tab, in cells
+	Y          int    `json:"pane_y"`
+	W          int    `json:"pane_columns"`
+	H          int    `json:"pane_rows"`
 }
 
 // tabMark: the status the claude-tab-status plugin appends to a tab's name. The panel shows status itself.
@@ -149,8 +154,26 @@ func (z *zellij) dump(session string, pane int) (string, error) {
 	return string(out), err
 }
 
+// dumpANSI: the screen with its colours, which tell what's typed in Claude Code's box from what it suggests.
+func (z *zellij) dumpANSI(session string, pane int) (string, error) {
+	out, err := z.action(session, "dump-screen", "--ansi", "--pane-id", pid(pane))
+	return string(out), err
+}
+
 func (z *zellij) closePane(session string, pane int) error {
 	_, err := z.action(session, "close-pane", "--pane-id", pid(pane))
+	return err
+}
+
+// renameTab names one tab by its id (no focus moves); "--": a name may start with "-".
+func (z *zellij) renameTab(session string, tab int, name string) error {
+	_, err := z.action(session, "rename-tab", "--tab-id", strconv.Itoa(tab), "--", name)
+	return err
+}
+
+// renameSession gives a session a new name (its panes and what runs in them carry on).
+func (z *zellij) renameSession(session, name string) error {
+	_, err := z.action(session, "rename-session", name)
 	return err
 }
 
@@ -251,24 +274,70 @@ func (z *zellij) newTab(session, name, cwd string) (int, error) {
 // ---- prompts: permission requests, questions, the startup trust dialog ----
 
 type PromptOpt struct {
-	N     string `json:"n,omitempty"` // digit shortcut, if the options are numbered
+	N       string `json:"n,omitempty"` // its number, if the options are numbered
+	Label   string `json:"label"`
+	Sel     bool   `json:"sel,omitempty"`     // currently highlighted (❯)
+	Desc    string `json:"desc,omitempty"`    // the line(s) under it
+	Box     bool   `json:"box,omitempty"`     // a multi-select's checkbox…
+	Checked bool   `json:"checked,omitempty"` // …ticked
+	Text    bool   `json:"text,omitempty"`    // the free-text answer ("Type something."): typing goes into it…
+	Value   string `json:"value,omitempty"`   // …and what it holds now
+	Next    bool   `json:"next,omitempty"`    // a multi-select's "Next": on to the next question
+}
+
+// PromptTab is one question of a dialog that asks several, as its row of tabs shows it.
+type PromptTab struct {
 	Label string `json:"label"`
-	Sel   bool   `json:"sel,omitempty"` // currently highlighted (❯)
+	Done  bool   `json:"done,omitempty"`
+}
+
+// PromptQA is one answer a dialog asks you to review before it submits them.
+type PromptQA struct {
+	Q string `json:"q"`
+	A string `json:"a"`
 }
 
 // Prompt is a question a TUI is blocked on, read off the pane's screen.
 type Prompt struct {
-	Q    string      `json:"q"`
-	Ctx  []string    `json:"ctx,omitempty"`
-	Opts []PromptOpt `json:"opts"`
-	Sig  string      `json:"sig"` // identifies this exact question: an answer must name it
+	Q      string      `json:"q"`
+	Ctx    []string    `json:"ctx,omitempty"`
+	Opts   []PromptOpt `json:"opts"`
+	Multi  bool        `json:"multi,omitempty"` // checkboxes: Enter ticks one, Next moves on
+	Tabs   []PromptTab `json:"tabs,omitempty"`
+	Review []PromptQA  `json:"review,omitempty"`
+	Sig    string      `json:"sig"`              // identifies this exact question: an answer must name it
+	DenyAt int64       `json:"denyAt,omitempty"` // when Claude Code denies it by itself (unix ms): its countdown, no part of the question
 }
 
 var (
-	optRe    = regexp.MustCompile(`^\s*(?:([❯›>])\s*)?(\d)\.\s+(\S.*?)\s*$`)
+	optRe    = regexp.MustCompile(`^\s*(?:([❯›>])\s*)?(\d{1,2})\.\s+(\S.*?)\s*$`)
 	hintRe   = regexp.MustCompile(`(?i)enter to (confirm|select)|esc to cancel`)
-	borderRe = regexp.MustCompile(`^[\s─━═╭╮╰╯┌┐└┘]*$`)
+	borderRe = regexp.MustCompile(`^[\s─━═╭╮╰╯┌┐└┘▔]*$`)
+	dashRe   = regexp.MustCompile(`^\s*[╌┄┈]+\s*$`)        // a dashed rule inside a dialog: around a command, a file, a plan
+	tabsRe   = regexp.MustCompile(`^\s*←\s.*[☐☒✔].*→\s*$`) // Claude Code's questions: "←  ☒ Color  ☐ Pets  ✔ Submit  →"
+	boxRe    = regexp.MustCompile(`^\[([ ✔✓xX])\]\s*(.*)$`)
+	typeRe   = regexp.MustCompile(`^(Type something\.?|Tell Claude what to change)$`) // a free-text option, empty
+	denyRe   = regexp.MustCompile(`Claude Code will automatically deny this request in (?:(\d+):(\d\d)|about (\d+) (second|minute))`)
 )
+
+// denyIn reads Claude Code's countdown on a dialog (2.1.300): "… deny this request in 1:38, …", or in
+// screen-reader mode "in about 2 minutes".
+func denyIn(line string) (time.Duration, bool) {
+	m := denyRe.FindStringSubmatch(line)
+	if m == nil {
+		return 0, false
+	}
+	if m[1] != "" {
+		mins, _ := strconv.Atoi(m[1])
+		secs, _ := strconv.Atoi(m[2])
+		return time.Duration(mins*60+secs) * time.Second, true
+	}
+	n, _ := strconv.Atoi(m[3])
+	if m[4] == "minute" {
+		return time.Duration(n) * time.Minute, true
+	}
+	return time.Duration(n) * time.Second, true
+}
 
 func cleanLine(s string) string {
 	return strings.TrimSpace(strings.Trim(strings.TrimSpace(s), "│┃"))
@@ -289,23 +358,132 @@ func labelCol(line string) (col int, marked bool) {
 	return i, marked
 }
 
-// parsePrompt finds the choice list just above an "Enter to confirm / Esc to cancel" hint: numbered
-// options ("❯ 1. Yes"), or plain ones where ❯ marks the highlighted line. Above the list sit the
-// question (the lowest line with a "?") and its context, up to the dialog's border.
+func labelOf(line string) (string, bool) {
+	c, marked := labelCol(line)
+	return strings.TrimSpace(string([]rune(line)[c:])), marked
+}
+
+// parseTabs reads a dialog's questions off its row of tabs: ☐ unanswered, ☒ answered (✔ Submit is the last step).
+func parseTabs(line string) []PromptTab {
+	var tabs []PromptTab
+	var mark rune
+	var b strings.Builder
+	flush := func() {
+		if mark == '☐' || mark == '☒' {
+			tabs = append(tabs, PromptTab{Label: trunc(strings.TrimSpace(b.String()), 40), Done: mark == '☒'})
+		}
+		b.Reset()
+	}
+	for _, r := range strings.Trim(strings.TrimSpace(line), "←→") {
+		if r == '☐' || r == '☒' || r == '✔' {
+			flush()
+			mark = r
+			continue
+		}
+		b.WriteRune(r)
+	}
+	flush()
+	return tabs
+}
+
+// chatBox: the line of Claude Code's chat box ("❯ " and what's typed, flush left). Its dialogs take the box's
+// place, so a dialog's words with the box under them are in the conversation (quoted, or a list in a reply).
+func chatBox(l string) bool { return strings.HasPrefix(l, "❯") && !optRe.MatchString(l) }
+
+func indentOf(l string) int {
+	return utf8.RuneCountInString(l) - utf8.RuneCountInString(strings.TrimLeft(l, " "))
+}
+
+// footless finds a dialog Claude Code draws with no footer ("Switch model?" after /model, a plan to approve):
+// the lowest highlighted numbered option, under the ▔ edge Claude Code draws in its chat box's place, with no
+// chat box under it. It returns the line after its options (its own hints may follow), or -1.
+func footless(lines []string) int {
+	sel := -1
+	for i := len(lines) - 1; i >= 0 && sel < 0; i-- {
+		if chatBox(lines[i]) {
+			return -1
+		}
+		if m := optRe.FindStringSubmatch(lines[i]); m != nil && m[1] != "" {
+			sel = i
+		}
+	}
+	edge := false
+	for i := sel - 1; i >= 0 && !edge && !chatBox(lines[i]); i-- {
+		edge = strings.HasPrefix(strings.TrimSpace(lines[i]), "▔")
+	}
+	if sel < 0 || !edge {
+		return -1
+	}
+	h, ind := sel+1, indentOf(lines[sel])
+	for ; h < len(lines); h++ { // the options go on while the lines are options, under one (its description) or blank
+		if l := lines[h]; strings.TrimSpace(l) != "" && !optRe.MatchString(l) && indentOf(l) <= ind {
+			break
+		}
+	}
+	return h
+}
+
+// unwrap joins the lines a dialog's text was wrapped into at the pane's width: a line continues on the next when
+// the next one's first word wouldn't have fit after it (it reaches within a word of the dialog's widest line) and
+// it doesn't end a sentence. "" separates paragraphs and goes.
+func unwrap(ls []string) []string {
+	w := 0
+	for _, l := range ls {
+		w = max(w, utf8.RuneCountInString(l))
+	}
+	var out []string
+	prev := ""
+	for _, l := range ls {
+		word, _, _ := strings.Cut(l, " ")
+		switch {
+		case l == "":
+		case prev != "" && len(out) > 0 && !strings.ContainsAny(prev[len(prev)-1:], ".?!:") && !strings.HasPrefix(l, "● ") && !strings.HasPrefix(l, "→ ") &&
+			utf8.RuneCountInString(prev)+1+utf8.RuneCountInString(word) > w:
+			out[len(out)-1] += " " + l
+		default:
+			out = append(out, l)
+		}
+		prev = l
+	}
+	return out
+}
+
+// parsePrompt finds the choice list just above an "Enter to select / Esc to cancel" footer (or, with none: on a
+// question dialog's review step, at the bottom of the screen; on Claude Code's other footless dialogs, under the
+// ▔ edge it draws in its chat box's place): numbered options ("❯ 1. Yes"), or plain ones where ❯ marks the
+// highlighted line. Under a numbered option sits its description; Claude Code's questions add a free-text option
+// (the last above a rule, "Chat about this" below it; on a plan, "Tell Claude what to change"), checkboxes and a
+// Next line when several answers may be picked, and a row of tabs when they ask several questions. Above the list
+// sit the question (the lowest sentence with a "?") and its context — a command, a file, a plan — up to the
+// dialog's top edge. Nothing with the chat box under it is a dialog: the dialog would be in the box's place.
 func parsePrompt(screen string) *Prompt {
 	lines := strings.Split(screen, "\n")
 	h := -1
-	for i := len(lines) - 1; i >= 0; i-- {
+	for i := len(lines) - 1; i >= 0 && !chatBox(lines[i]); i-- {
 		if hintRe.MatchString(lines[i]) {
 			h = i
 			break
+		}
+	}
+	for h > 0 && hintRe.MatchString(lines[h-1]) { // a footer wrapped in a narrow pane
+		h--
+	}
+	if h < 0 {
+		tabs := false
+		for _, l := range lines {
+			tabs = tabs || tabsRe.MatchString(l)
+		}
+		if h = footless(lines); h < 0 && !tabs {
+			return nil
+		} else if h < 0 {
+			h = len(lines)
 		}
 	}
 	e := h - 1
 	for e >= 0 && strings.TrimSpace(lines[e]) == "" {
 		e--
 	}
-	if h < 0 || e < 0 {
+	if e < 0 {
 		return nil
 	}
 	s := e
@@ -314,15 +492,71 @@ func parsePrompt(screen string) *Prompt {
 	}
 	p := &Prompt{}
 	first := -1
-	for i := s; i <= e; i++ { // numbered: option lines, skipping description lines under them
+	var opts []PromptOpt
+	var under [][]string // the lines under each numbered option, up to the next one
+	rule := -1           // the option a rule follows
+	for i := s; i <= e; i++ {
 		if m := optRe.FindStringSubmatch(lines[i]); m != nil {
 			if first < 0 {
 				first = i
 			}
-			p.Opts = append(p.Opts, PromptOpt{N: m[2], Label: trunc(m[3], 120), Sel: m[1] != ""})
+			o := PromptOpt{N: m[2], Label: m[3], Sel: m[1] != ""}
+			if b := boxRe.FindStringSubmatch(o.Label); b != nil {
+				p.Multi, o.Box, o.Checked, o.Label = true, true, b[1] != " ", b[2]
+			}
+			o.Label = trunc(o.Label, 120)
+			opts, under = append(opts, o), append(under, nil)
+		} else if len(opts) > 0 && strings.ContainsRune(lines[i], '─') && borderRe.MatchString(lines[i]) {
+			if rule < 0 {
+				rule = len(opts) - 1
+			}
+		} else if len(opts) > 0 {
+			under[len(opts)-1] = append(under[len(opts)-1], lines[i])
 		}
 	}
-	if first < 0 { // plain: the lines aligned with the highlighted one
+	if first >= 0 {
+		txt := -1
+		if rule >= 0 && rule < len(opts)-1 { // the free-text option is the last above the rule
+			txt = rule
+		}
+		for i, o := range opts {
+			if typeRe.MatchString(o.Label) || strings.Contains(strings.Join(strings.Fields(strings.Join(under[i], " ")), " "), "approve with this feedback") {
+				txt = i // a plan's feedback option keeps its hint under it once typed into
+			}
+		}
+		for i, o := range opts {
+			var ls []string
+			for _, l := range under[i] {
+				ls = append(ls, strings.TrimSpace(l))
+			}
+			if i == txt {
+				for j, l := range ls {
+					if strings.HasPrefix(l, "shift+tab to approve") { // its hint, not what's typed
+						ls = ls[:j]
+						break
+					}
+				}
+				var next *PromptOpt
+				if p.Multi && len(ls) > 0 { // the last line under it is Next
+					label, marked := labelOf(under[i][len(ls)-1])
+					next, ls = &PromptOpt{Label: trunc(label, 40), Sel: marked, Next: true}, ls[:len(ls)-1]
+				}
+				o.Text = true
+				if !typeRe.MatchString(o.Label) {
+					o.Value = trunc(strings.Join(append([]string{o.Label}, ls...), " "), 500)
+				}
+				p.Opts = append(p.Opts, o)
+				if next != nil {
+					p.Opts = append(p.Opts, *next)
+				}
+				continue
+			}
+			if d := strings.Join(ls, " "); d != o.Label {
+				o.Desc = trunc(d, 300)
+			}
+			p.Opts = append(p.Opts, o)
+		}
+	} else { // plain: the lines aligned with the highlighted one
 		sel := -1
 		for i := s; i <= e; i++ {
 			if _, marked := labelCol(lines[i]); marked {
@@ -349,16 +583,37 @@ func parsePrompt(screen string) *Prompt {
 			p.Opts = append(p.Opts, PromptOpt{Label: trunc(strings.TrimSpace(string([]rune(lines[i])[c:])), 120), Sel: marked})
 		}
 	}
-	var ctx []string // the dialog above the options, top to bottom
-	for i := first - 1; i >= 0 && len(ctx) < 8; i-- {
-		t := cleanLine(lines[i])
-		if t == "" {
+	var above []string // the dialog above the options, top to bottom; "" between its paragraphs
+	for i := first - 1; i >= 0 && len(above) < 60; i-- {
+		l := lines[i]
+		t := cleanLine(l)
+		if strings.HasPrefix(t, "▔") || (t != "" && borderRe.MatchString(l) && !strings.HasPrefix(l, " ")) {
+			break // its top edge: a rule across the pane, or Claude Code's ▔ (its rules inside are indented)
+		}
+		if t == "" || borderRe.MatchString(l) || dashRe.MatchString(l) {
+			above = append([]string{""}, above...)
 			continue
 		}
-		if borderRe.MatchString(lines[i]) {
-			break
+		above = append([]string{t}, above...)
+	}
+	above = unwrap(above)
+	var ctx []string
+	for i := 0; i < len(above); i++ {
+		switch a := above[i]; {
+		case tabsRe.MatchString(a):
+			p.Tabs = parseTabs(a)
+		case strings.HasPrefix(a, "● ") && i+1 < len(above) && strings.HasPrefix(above[i+1], "→ "):
+			p.Review = append(p.Review, PromptQA{Q: trunc(strings.TrimPrefix(a, "● "), 200), A: trunc(strings.TrimPrefix(above[i+1], "→ "), 300)})
+			i++
+		case denyRe.MatchString(a): // it ticks: in the question it would make every answer stale
+			d, _ := denyIn(a)
+			p.DenyAt = time.Now().Add(d).UnixMilli()
+		default:
+			ctx = append(ctx, trunc(a, 300))
 		}
-		ctx = append([]string{trunc(t, 300)}, ctx...)
+	}
+	if len(ctx) > 8 {
+		ctx = ctx[len(ctx)-8:]
 	}
 	qi := -1
 	for i := len(ctx) - 1; i >= 0; i-- {
@@ -374,7 +629,9 @@ func parsePrompt(screen string) *Prompt {
 	if len(ctx) > 6 {
 		ctx = ctx[len(ctx)-6:]
 	}
-	p.Ctx = ctx
+	if len(ctx) > 0 {
+		p.Ctx = ctx
+	}
 	sig := sha256.New()
 	fmt.Fprintf(sig, "%q %q", p.Q, p.Ctx)
 	for _, o := range p.Opts {
@@ -384,29 +641,91 @@ func parsePrompt(screen string) *Prompt {
 	return p
 }
 
-// keysFor answers with the option labelled label: its digit, or arrows from the highlighted line then Enter.
-func (p *Prompt) keysFor(label string) ([]string, bool) {
-	sel, idx := 0, -1
+// Answer is what the page chose for the prompt on screen.
+type Answer struct {
+	Choose string   // one option, by label
+	Text   string   // what the free-text option should say: the answer when it's the one chosen; with a multi-select, an extra one
+	Checks []string // a multi-select: the options to leave ticked, by label
+}
+
+var errNoText = errors.New("type an answer first")
+
+// keyStep is one write to the pane: keys, or text pasted into the free-text option.
+type keyStep struct {
+	Keys []string
+	Text string
+}
+
+// steps turns an answer into what to send. Arrows, never an option's digit: on the free-text option a digit is
+// text. The free text is cleared (Ctrl u) before it's pasted. A multi-select ticks with Enter, one option at a
+// time, then takes the free text (typing ticks it) and moves on with Next.
+func (p *Prompt) steps(a Answer) ([]keyStep, error) {
+	pos := 0
 	for i, o := range p.Opts {
 		if o.Sel {
-			sel = i
-		}
-		if o.Label == label {
-			idx = i
+			pos = i
 		}
 	}
-	if idx < 0 {
-		return nil, false
+	moveTo := func(i int, then ...string) []string {
+		var k []string
+		for ; pos < i; pos++ {
+			k = append(k, "Down")
+		}
+		for ; pos > i; pos-- {
+			k = append(k, "Up")
+		}
+		return append(k, then...)
 	}
-	if n := p.Opts[idx].N; n != "" {
-		return []string{n}, true
+	text := strings.Join(strings.Fields(a.Text), " ") // one line: a newline would send it
+	var st []keyStep
+	typeIn := func(i int) {
+		st = append(st, keyStep{Keys: moveTo(i, "Ctrl u")})
+		if text != "" {
+			st = append(st, keyStep{Text: text})
+		}
 	}
-	var keys []string
-	for i := sel; i < idx; i++ {
-		keys = append(keys, "Down")
+	if !p.Multi || a.Choose != "" { // one option (a multi-select's too: "Chat about this")
+		for i, o := range p.Opts {
+			switch {
+			case o.Label != a.Choose || o.Next || o.Box: // a checkbox is ticked, not chosen
+			case !o.Text:
+				return []keyStep{{Keys: moveTo(i, "Enter")}}, nil
+			case text == "":
+				return nil, errNoText
+			default:
+				typeIn(i)
+				return append(st, keyStep{Keys: []string{"Enter"}}), nil
+			}
+		}
+		return nil, errors.New("no such option on screen")
 	}
-	for i := sel; i > idx; i-- {
-		keys = append(keys, "Up")
+	want := map[string]bool{}
+	for _, c := range a.Checks {
+		ok := false
+		for _, o := range p.Opts {
+			ok = ok || (o.Box && !o.Text && o.Label == c)
+		}
+		if !ok {
+			return nil, errors.New("no such option on screen: " + trunc(c, 40))
+		}
+		want[c] = true
 	}
-	return append(keys, "Enter"), true
+	txt, next := -1, -1
+	for i, o := range p.Opts {
+		switch {
+		case o.Text:
+			txt = i
+		case o.Next:
+			next = i
+		case o.Box && o.Checked != want[o.Label]:
+			st = append(st, keyStep{Keys: moveTo(i, "Enter")})
+		}
+	}
+	if txt >= 0 && text != p.Opts[txt].Value {
+		typeIn(txt)
+	}
+	if next < 0 {
+		return nil, errors.New("no Next on screen")
+	}
+	return append(st, keyStep{Keys: moveTo(next, "Enter")}), nil
 }

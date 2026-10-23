@@ -15,6 +15,7 @@ import (
 type fakeOps struct {
 	calls []string
 	nice  map[int]int
+	comm  map[int]string
 }
 
 func (f *fakeOps) ops(protected map[int]string) procOps {
@@ -43,6 +44,7 @@ func (f *fakeOps) ops(protected map[int]string) procOps {
 			}
 			return true, true
 		},
+		comm: func(pid int) string { return f.comm[pid] },
 	}
 }
 
@@ -78,6 +80,47 @@ func TestLimiterApplyAndRemove(t *testing.T) {
 	}
 	if len(l.list()) != 0 {
 		t.Fatalf("rules after remove: %+v", l.list())
+	}
+}
+
+// The CI reserve: everything but CI (and groups with cores of their own) leaves the kept cores while a job runs,
+// the runners get every core, and once CI is idle the kept cores are everyone's again, once.
+func TestCIReserve(t *testing.T) {
+	f := &fakeOps{comm: map[int]string{}}
+	l := newLimiter(filepath.Join(t.TempDir(), "limits.json"), 10, f.ops(nil))
+	for _, r := range []Limit{{Key: restKey, Label: "Everything but CI", Cores: []int{0, 1, 2, 3, 4, 5}}, {Key: "own", Label: "own", Cores: []int{9}}} {
+		if err := l.set(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pass := func(job bool) string {
+		f.calls = nil
+		f.comm[600] = map[bool]string{true: "Runner.Worker", false: "Runner.Listener"}[job]
+		l.apply(map[string][]int{"runner:r1": {600}, "pane:x": {100}, "own": {200}})
+		return strings.Join(f.calls, "|")
+	}
+	all := "0,1,2,3,4,5,6,7,8,9"
+	if got := pass(false); got != "aff 100 "+all+"|aff 101 "+all+"|aff 200 9|aff 201 9" {
+		t.Fatalf("idle after a start: everything gets every core once, own rules hold: %s", got)
+	}
+	if got := pass(false); got != "aff 200 9|aff 201 9" {
+		t.Fatalf("idle again: the reserve leaves everything be: %s", got)
+	}
+	if got := pass(true); got != "aff 600 "+all+"|aff 601 "+all+"|aff 100 0,1,2,3,4,5|aff 101 0,1,2,3,4,5|aff 200 9|aff 201 9" {
+		t.Fatalf("a job runs: %s", got)
+	}
+	if got := pass(false); !strings.HasPrefix(got, "aff 100 "+all+"|aff 101 "+all+"|") {
+		t.Fatalf("the job ended: the kept cores are everyone's again: %s", got)
+	}
+	pass(true)
+	if err := l.remove(restKey); err != nil {
+		t.Fatal(err)
+	}
+	if got := pass(true); got != "aff 100 "+all+"|aff 101 "+all+"|aff 200 9|aff 201 9" {
+		t.Fatalf("reserve removed mid-job: %s", got)
+	}
+	if err := l.set(Limit{Key: restKey, Cores: []int{0}, Nice: 10}); err == nil {
+		t.Fatal("the reserve takes cores only")
 	}
 }
 

@@ -351,3 +351,34 @@ func TestAccessFetchRateLimitedWhenCertsUnavailable(t *testing.T) {
 		t.Fatalf("fetch called %d times within a minute while certs unavailable", calls)
 	}
 }
+
+func TestSessionsSurviveARestart(t *testing.T) {
+	dir := t.TempDir()
+	pin := filepath.Join(dir, "pin")
+	audit := openAudit(filepath.Join(dir, "audit.jsonl"))
+	now := time.Unix(1_000_000, 0)
+	clock := func() time.Time { return now }
+	a := newAuth(pin, audit, clock)
+	tok := a.newSession("me@x")
+	gone := a.newSession("me@x")
+	a.endSession(gone) // logged out: stays out
+
+	b := newAuth(pin, audit, clock) // the panel restarted
+	if !b.validSession(tok, "me@x") {
+		t.Fatal("a session must survive a restart")
+	}
+	if b.validSession(gone, "me@x") || b.validSession(tok, "someone@else") {
+		t.Fatal("a logged-out session, or another identity, must not")
+	}
+	raw, _ := os.ReadFile(filepath.Join(dir, "sessions.json"))
+	if strings.Contains(string(raw), tok) || len(raw) == 0 {
+		t.Fatalf("the file keeps only a hash of each token: %s", raw)
+	}
+	if fi, _ := os.Stat(filepath.Join(dir, "sessions.json")); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("sessions.json mode %v", fi.Mode().Perm())
+	}
+	now = now.Add(sessionIdle + time.Minute)
+	if c := newAuth(pin, audit, clock); c.validSession(tok, "me@x") {
+		t.Fatal("an expired session must not come back")
+	}
+}

@@ -14,10 +14,14 @@ type fakeZellij struct {
 	dirs     []string
 	answers  map[string]string // joined argv prefix → stdout
 	attached []string
+	onCall   func(args []string) // a test's hook: the pane reacting to keys (a cleared box)
 }
 
 func (f *fakeZellij) run(_ context.Context, dir string, args ...string) ([]byte, error) {
 	f.calls = append(f.calls, args)
+	if f.onCall != nil {
+		f.onCall(args)
+	}
 	f.dirs = append(f.dirs, dir)
 	j := strings.Join(args, " ")
 	best := ""
@@ -157,7 +161,7 @@ func TestParsePrompt(t *testing.T) {
 	if p.Q != "Do you want to proceed?" {
 		t.Fatalf("q = %q", p.Q)
 	}
-	if len(p.Opts) != 3 || p.Opts[0] != (PromptOpt{"1", "Yes", true}) || p.Opts[2] != (PromptOpt{"3", "No", false}) {
+	if len(p.Opts) != 3 || p.Opts[0] != (PromptOpt{N: "1", Label: "Yes", Sel: true}) || p.Opts[2] != (PromptOpt{N: "3", Label: "No"}) {
 		t.Fatalf("opts = %+v", p.Opts)
 	}
 	if len(p.Ctx) == 0 || p.Ctx[len(p.Ctx)-1] != "Dangerous rm operation on possibly-empty variable path" {
@@ -172,8 +176,8 @@ func TestParsePromptIgnoresNumberedListsInOutput(t *testing.T) {
 	}
 }
 
-const trustScreen = `claude
-➜  /tmp claude
+const trustScreen = `claude-multi
+➜  /tmp claude-multi
 
 ────────────────────────────────────────────────
  Accessing workspace:
@@ -202,7 +206,7 @@ func TestParsePromptUnnumberedChoices(t *testing.T) {
 	if p == nil {
 		t.Fatal("no prompt")
 	}
-	want := []PromptOpt{{"", "No, exit", true}, {"", "Yes, I trust this folder", false}}
+	want := []PromptOpt{{Label: "No, exit", Sel: true}, {Label: "Yes, I trust this folder"}}
 	if !reflect.DeepEqual(p.Opts, want) {
 		t.Fatalf("opts = %+v", p.Opts)
 	}
@@ -232,25 +236,206 @@ func TestParsePromptQuestionWithDescriptions(t *testing.T) {
 	if p == nil || p.Q != "Which environment should I deploy to?" {
 		t.Fatalf("prompt = %+v", p)
 	}
-	want := []PromptOpt{{"1", "Staging", true}, {"2", "Production", false}, {"3", "Type something.", false}}
+	want := []PromptOpt{{N: "1", Label: "Staging", Sel: true, Desc: "Safe to break"}, {N: "2", Label: "Production", Desc: "Real customers"}, {N: "3", Label: "Type something.", Text: true}}
 	if !reflect.DeepEqual(p.Opts, want) {
 		t.Fatalf("opts = %+v", p.Opts)
 	}
 }
 
 func TestChooseKeys(t *testing.T) {
+	keys := func(p *Prompt, label string) string {
+		st, err := p.steps(Answer{Choose: label})
+		if err != nil {
+			return "error: " + err.Error()
+		}
+		return stepsString(st)
+	}
 	p := parsePrompt(trustScreen)
-	if k, ok := p.keysFor("Yes, I trust this folder"); !ok || strings.Join(k, ",") != "Down,Enter" {
-		t.Fatalf("keys = %v %v", k, ok)
+	if k := keys(p, "Yes, I trust this folder"); k != "Down Enter" {
+		t.Fatalf("keys = %q", k)
 	}
-	if k, ok := p.keysFor("No, exit"); !ok || strings.Join(k, ",") != "Enter" {
-		t.Fatalf("keys = %v %v", k, ok)
+	if k := keys(p, "No, exit"); k != "Enter" {
+		t.Fatalf("keys = %q", k)
 	}
-	if k, ok := parsePrompt(promptScreen).keysFor("No"); !ok || strings.Join(k, ",") != "3" {
-		t.Fatalf("numbered keys = %v %v", k, ok)
+	if k := keys(parsePrompt(promptScreen), "No"); k != "Down Down Enter" {
+		t.Fatalf("numbered keys = %q (arrows, never the digit: a free-text option would take it as text)", k)
 	}
-	if _, ok := p.keysFor("Maybe"); ok {
+	if k := keys(p, "Maybe"); !strings.HasPrefix(k, "error") {
 		t.Fatal("unknown label accepted")
+	}
+}
+
+// Claude Code's AskUserQuestion with several questions: their tabs on top, a description under each option,
+// the free-text option (here holding "44", typed earlier) and "Chat about this" below a rule.
+const askTabsScreen = `● Checking for any notes on Baker's PMS.
+────────────────────────────────────────────────
+←  ☐ Baker PMS  ☐ Fleet 10DLC  ☐ Test SMS  ✔ Submit  →
+
+Which PMS is Baker on (the 'new PMS integration')?
+
+  1. AppFolio
+     Supported today; Block 2 can run right away.
+  2. Buildium
+     Supported; same Block 2 path.
+  3. Rent Manager
+     Check support level first.
+❯ 4. 44
+────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · ctrl+g to edit in Vim · Esc to cancel
+`
+
+// a multi-select question in a narrow pane: checkboxes, "Next" under the free-text option, the footer wrapped
+const askMultiScreen = `────────────────────
+←  ☒ Color  ☐ Pets  ☐ Size  ✔ Submit  →
+
+Which pets do you have?
+
+  1. [✔] Cat
+         Cat
+  2. [ ] Dog
+         Dog
+❯ 3. [ ] Fish
+         Fish
+  4. [ ] Type something
+     Next
+────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate ·
+Esc to cancel
+`
+
+// the last step: the answers to review, and no footer at all
+const askReviewScreen = `────────────────────
+←  ☒ Color  ☒ Pets  ☒ Size  ✔ Submit  →
+
+Review your answers
+
+ ● Which color do you prefer?
+   → Purple, like a real aurora
+ ● Which pets do you have?
+   → Cat, Fish
+
+Ready to submit your answers?
+
+❯ 1. Submit answers
+  2. Cancel
+
+
+`
+
+func TestParseAskWithTabsDescriptionsAndFreeText(t *testing.T) {
+	p := parsePrompt(askTabsScreen)
+	if p == nil || p.Q != "Which PMS is Baker on (the 'new PMS integration')?" || len(p.Ctx) != 0 || p.Multi {
+		t.Fatalf("prompt = %+v", p)
+	}
+	if want := []PromptTab{{"Baker PMS", false}, {"Fleet 10DLC", false}, {"Test SMS", false}}; !reflect.DeepEqual(p.Tabs, want) {
+		t.Fatalf("tabs = %+v", p.Tabs)
+	}
+	want := []PromptOpt{
+		{N: "1", Label: "AppFolio", Desc: "Supported today; Block 2 can run right away."},
+		{N: "2", Label: "Buildium", Desc: "Supported; same Block 2 path."},
+		{N: "3", Label: "Rent Manager", Desc: "Check support level first."},
+		{N: "4", Label: "44", Sel: true, Text: true, Value: "44"},
+		{N: "5", Label: "Chat about this"},
+	}
+	if !reflect.DeepEqual(p.Opts, want) {
+		t.Fatalf("opts =\n%+v\nwant\n%+v", p.Opts, want)
+	}
+	// the placeholder is no answer
+	if q := parsePrompt(strings.Replace(askTabsScreen, "❯ 4. 44", "❯ 4. Type something.", 1)); q.Opts[3].Value != "" || !q.Opts[3].Text {
+		t.Fatalf("placeholder = %+v", q.Opts[3])
+	}
+}
+
+func TestParseAskMultiSelect(t *testing.T) {
+	p := parsePrompt(askMultiScreen)
+	if p == nil || p.Q != "Which pets do you have?" || !p.Multi {
+		t.Fatalf("prompt = %+v", p)
+	}
+	if want := []PromptTab{{"Color", true}, {"Pets", false}, {"Size", false}}; !reflect.DeepEqual(p.Tabs, want) {
+		t.Fatalf("tabs = %+v", p.Tabs)
+	}
+	want := []PromptOpt{
+		{N: "1", Label: "Cat", Box: true, Checked: true},
+		{N: "2", Label: "Dog", Box: true},
+		{N: "3", Label: "Fish", Sel: true, Box: true},
+		{N: "4", Label: "Type something", Box: true, Text: true},
+		{Label: "Next", Next: true},
+		{N: "5", Label: "Chat about this"},
+	}
+	if !reflect.DeepEqual(p.Opts, want) {
+		t.Fatalf("opts =\n%+v\nwant\n%+v", p.Opts, want)
+	}
+}
+
+func TestParseAskReview(t *testing.T) {
+	p := parsePrompt(askReviewScreen)
+	if p == nil || p.Q != "Ready to submit your answers?" {
+		t.Fatalf("prompt = %+v", p)
+	}
+	if want := []PromptQA{{"Which color do you prefer?", "Purple, like a real aurora"}, {"Which pets do you have?", "Cat, Fish"}}; !reflect.DeepEqual(p.Review, want) {
+		t.Fatalf("review = %+v", p.Review)
+	}
+	if len(p.Opts) != 2 || p.Opts[0].Label != "Submit answers" || !p.Opts[0].Sel {
+		t.Fatalf("opts = %+v", p.Opts)
+	}
+	// without the question tabs, a numbered list at the bottom of the screen is no question
+	if q := parsePrompt(strings.Replace(askReviewScreen, "←  ☒ Color  ☒ Pets  ☒ Size  ✔ Submit  →", "", 1)); q != nil {
+		t.Fatalf("false prompt: %+v", q)
+	}
+}
+
+func stepsString(st []keyStep) string {
+	var out []string
+	for _, s := range st {
+		if s.Text != "" {
+			out = append(out, "text:"+s.Text)
+		} else {
+			out = append(out, strings.Join(s.Keys, " "))
+		}
+	}
+	return strings.Join(out, " | ")
+}
+
+func TestAnswerSteps(t *testing.T) {
+	ask, multi := parsePrompt(askTabsScreen), parsePrompt(askMultiScreen)
+	for _, c := range []struct {
+		p    *Prompt
+		a    Answer
+		want string
+	}{
+		{ask, Answer{Choose: "AppFolio"}, "Up Up Up Enter"},
+		{ask, Answer{Choose: "Chat about this"}, "Down Enter"},
+		// the free text: cleared first (it held "44"), then pasted, then sent
+		{ask, Answer{Choose: "44", Text: "Yardi\nBreeze"}, "Ctrl u | text:Yardi Breeze | Enter"},
+		// ticks to change one by one, the free text (typing ticks it), then Next
+		{multi, Answer{Checks: []string{"Dog", "Fish"}, Text: "Parrot"}, "Up Up Enter | Down Enter | Down Enter | Down Ctrl u | text:Parrot | Down Enter"},
+		{multi, Answer{Checks: []string{"Cat"}}, "Down Down Enter"},
+		{multi, Answer{Choose: "Chat about this"}, "Down Down Down Enter"},
+	} {
+		st, err := c.p.steps(c.a)
+		if err != nil || stepsString(st) != c.want {
+			t.Errorf("%+v: %q %v, want %q", c.a, stepsString(st), err, c.want)
+		}
+		for _, s := range st {
+			for _, k := range s.Keys {
+				if len(k) == 1 && k[0] >= '0' && k[0] <= '9' {
+					t.Errorf("%+v: a digit key %q (the free-text option would take it as text)", c.a, k)
+				}
+			}
+		}
+	}
+	for _, a := range []Answer{{Choose: "Maybe"}, {Choose: "44"}, {Checks: []string{"Hamster"}}} {
+		p := ask
+		if a.Checks != nil {
+			p = multi
+		}
+		if _, err := p.steps(a); err == nil {
+			t.Errorf("%+v accepted", a)
+		}
 	}
 }
 

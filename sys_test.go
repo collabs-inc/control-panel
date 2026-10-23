@@ -50,6 +50,37 @@ func TestParseMeminfoConvertsKB(t *testing.T) {
 	}
 }
 
+func TestMemPartsAndPSI(t *testing.T) {
+	m := parseMeminfo([]byte("AnonPages: 100 kB\nCached: 50 kB\nBuffers: 10 kB\nShmem: 20 kB\nSlab: 7 kB\n"))
+	if apps, cache, kern := memParts(m); apps != 100<<10 || cache != 40<<10 || kern != 7<<10 {
+		t.Fatalf("parts = %d %d %d", apps, cache, kern)
+	}
+	if _, cache, _ := memParts(map[string]uint64{"Shmem": 5}); cache != 0 {
+		t.Fatalf("cache underflowed: %d", cache)
+	}
+	p := parsePSI([]byte("some avg10=1.50 avg60=0.25 avg300=0.00 total=14641876\nfull avg10=0.75 avg60=0.00 avg300=0.00 total=1\n"))
+	if p != (PSI{1.5, 0.25, 0, 0.75}) || parsePSI(nil) != (PSI{}) {
+		t.Fatalf("psi = %+v", p)
+	}
+}
+
+func TestRSSBaseIsOldestSnapshotOnceAnHourOld(t *testing.T) {
+	s := newSysSampler(t.TempDir())
+	t0 := time.Unix(0, 0)
+	for m := 0; m < 50; m++ { // a sample a minute: snapshots at 0, 10, …, 40 min
+		if s.rssBase(t0.Add(time.Duration(m)*time.Minute), map[string]uint64{"a": uint64(m)}) != nil {
+			t.Fatalf("base at %d min, before 50", m)
+		}
+	}
+	if b := s.rssBase(t0.Add(50*time.Minute), map[string]uint64{"a": 50}); b["a"] != 0 {
+		t.Fatalf("base at 50 min = %v, want the 0 min snapshot", b)
+	}
+	s.rssBase(t0.Add(60*time.Minute), nil)
+	if b := s.rssBase(t0.Add(75*time.Minute), nil); len(s.snaps) != 7 || b["a"] != 10 {
+		t.Fatalf("snaps=%d base=%v, want 7 kept and the 10 min one", len(s.snaps), b)
+	}
+}
+
 const netDev = `Inter-|   Receive                                                |  Transmit
  face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
     lo: 27128280655 27783394    0    0    0     0          0         0 27128280655 27783394    0    0    0     0       0          0
@@ -97,23 +128,26 @@ func TestGroupKey(t *testing.T) {
 		comm, parentComm      string
 		ppid                  int
 		parentKey, key, label string
+		cwd                   string
 	}{
-		{"runner by path wins over pane env", "/workspace/home/projects/ci-cd-jobs/fe2/bin/Runner.Listener\x00run\x00", pane, "Runner.Listener", "bash", 1, "", "runner:fe2", "CI runner fe2"},
-		{"job step by RUNNER_NAME", "python\x00-m\x00pytest\x00", "HOME=/x\x00RUNNER_NAME=cube-r4\x00", "python", "bash", 99, "bash", "runner:r4", "CI runner r4"},
-		{"pane root shell", "zsh\x00", pane, "zsh", "zellij", 5, "zellij", "pane:dev-1:10", "dev-1 · pane 10"},
-		{"descendant inherits parent group", "claude\x00", pane, "claude", "zsh", 7, "pane:dev-1:10", "pane:dev-1:10", "dev-1 · pane 10"},
-		{"daemonized from a pane groups by name", "/usr/bin/qemu-system-x86_64\x00", pane, "qemu-system-x86", "init", 1, "init", "qemu-system-x86", "qemu-system-x86"},
-		{"root interpreter labelled by script", "node\x00/workspace/home/.local/bin/teamclaude\x00server\x00", "", "node", "init", 1, "init", "node ~/.local/bin/teamclaude", "node ~/.local/bin/teamclaude"},
-		{"root bash -c labelled by command", "bash\x00-c\x00cd r1 && exec ./run.sh\x00", "", "bash", "init", 1, "init", "bash -c cd r1 && exec ./run.sh", "bash -c cd r1 && exec ./run.sh"},
-		{"root python flags skipped", "python3\x00-u\x00-m\x00http.server\x00", "", "python3", "init", 1, "init", "python3 -m http.server", "python3 -m http.server"},
-		{"kernel thread", "", "", "kworker/0:1", "kthreadd", 2, "kthreadd", "kworker/0:1", "kworker/0:1"},
+		{"runner by path wins over pane env", "/workspace/home/projects/ci-cd-jobs/fe2/bin/Runner.Listener\x00run\x00", pane, "Runner.Listener", "bash", 1, "", "runner:fe2", "CI runner fe2", ""},
+		{"job step by RUNNER_NAME", "python\x00-m\x00pytest\x00", "HOME=/x\x00RUNNER_NAME=cube-r4\x00", "python", "bash", 99, "bash", "runner:r4", "CI runner r4", ""},
+		{"pane root shell", "zsh\x00", pane, "zsh", "zellij", 5, "zellij", "pane:dev-1:10", "dev-1 · pane 10", ""},
+		{"descendant inherits parent group", "claude\x00", pane, "claude", "zsh", 7, "pane:dev-1:10", "pane:dev-1:10", "dev-1 · pane 10", ""},
+		{"daemonized from a pane groups by name", "/usr/bin/qemu-system-x86_64\x00", pane, "qemu-system-x86", "init", 1, "init", "qemu-system-x86", "qemu-system-x86", ""},
+		{"root interpreter labelled by script", "node\x00/workspace/home/.local/bin/teamclaude\x00server\x00", "", "node", "init", 1, "init", "node ~/.local/bin/teamclaude", "node ~/.local/bin/teamclaude", ""},
+		{"root bash -c labelled by command", "bash\x00-c\x00cd r1 && exec ./run.sh\x00", "", "bash", "init", 1, "init", "bash -c cd r1 && exec ./run.sh", "bash -c cd r1 && exec ./run.sh", ""},
+		{"root python flags skipped", "python3\x00-u\x00-m\x00http.server\x00", "", "python3", "init", 1, "init", "python3 -m http.server", "python3 -m http.server", ""},
+		{"kernel thread", "", "", "kworker/0:1", "kthreadd", 2, "kthreadd", "kworker/0:1", "kworker/0:1", ""},
+		{"a job's daemon, env wiped, by its folder", "redis-server 127.0.0.1:6390\x00", "", "redis-server", "init", 1, "init", "runner:r5", "CI runner r5", "/workspace/home/projects/ci-cd-jobs/r5/_work/app/app"},
+		{"a pane's process in a runner's folder stays the pane's", "zsh\x00", pane, "zsh", "zellij", 5, "zellij", "pane:dev-1:10", "dev-1 · pane 10", "/workspace/home/projects/ci-cd-jobs/r1"},
 	}
 	for _, c := range cases {
 		parentLabel := c.parentKey
 		if c.parentKey == "pane:dev-1:10" {
 			parentLabel = "dev-1 · pane 10"
 		}
-		k, l := groupKey([]byte(c.cmdline), []byte(c.environ), c.comm, c.parentComm, c.ppid, c.parentKey, parentLabel, "")
+		k, l := groupKey([]byte(c.cmdline), []byte(c.environ), c.comm, c.parentComm, c.ppid, c.parentKey, parentLabel, "", c.cwd)
 		if k != c.key || l != c.label {
 			t.Errorf("%s: got %q,%q want %q,%q", c.name, k, l, c.key, c.label)
 		}
@@ -251,7 +285,7 @@ func TestZellijSessionsMatchesSocketMtimeToServerStart(t *testing.T) {
 		11747: {PID: 11747, PPID: 1, Comm: "zellij", Start: 8999 * clkTck},
 		12:    {PID: 12, PPID: 4632, Comm: "zellij", Start: 100 * clkTck}, // a client, not a server
 	}
-	got := zellijSessions(stats, btime, dir)
+	got := zellijSessions(stats, btime, dir, func(int) []byte { return nil })
 	if len(got) != 2 || got[4632] != "dev-1" || got[11747] != "box-dev" {
 		t.Fatalf("got %v", got)
 	}
@@ -364,5 +398,55 @@ func TestPidsByKeyAncestorsFirst(t *testing.T) {
 	s.sample(time.Unix(1000, 0), sockScan{})
 	if got := s.pidsByKey()["pane:dev-1:4"]; fmt.Sprint(got) != "[30 950 900]" {
 		t.Fatalf("pids = %v, want root shell first", got)
+	}
+}
+
+func TestZellijSessionsSameSecondServersKeepTheirOwnSockets(t *testing.T) {
+	dir := t.TempDir()
+	btime := int64(1_790_000_000)
+	for _, name := range []string{"box-dev", "dev-1"} { // resurrected back to back: same second
+		p := filepath.Join(dir, name)
+		writeFile(t, p, "")
+		os.Chtimes(p, time.Unix(btime+2386, 0), time.Unix(btime+2386, 0))
+	}
+	stats := map[int]procStat{
+		7437: {PID: 7437, PPID: 1, Comm: "zellij", Start: 238652},
+		7487: {PID: 7487, PPID: 1, Comm: "zellij", Start: 238660},
+	}
+	cmdline := func(pid int) []byte {
+		return []byte(map[int]string{7437: "zellij\x00--server\x00" + dir + "/box-dev\x00", 7487: "zellij\x00--server\x00" + dir + "/dev-1\x00"}[pid])
+	}
+	for range 50 { // map order is random: one lucky run proves nothing
+		got := zellijSessions(stats, btime, dir, cmdline)
+		if len(got) != 2 || got[7437] != "box-dev" || got[7487] != "dev-1" {
+			t.Fatalf("got %v", got)
+		}
+	}
+}
+
+func TestSampleScriptPaneForegroundIsWhatItRuns(t *testing.T) {
+	root := fakeProc(t)
+	os.RemoveAll(root + "/123")
+	proc := func(pid, ppid, pgrp, tpgid int, comm, cmd string, paneID int) {
+		d := fmt.Sprintf("%s/%d/", root, pid)
+		writeFile(t, d+"stat", fmt.Sprintf("%d (%s) S %d %d 1 34816 %d 0 0 0 0 0 0 0 0 20 0 1 0 %d 0 10 0", pid, comm, ppid, pgrp, tpgid, 100+pid))
+		writeFile(t, d+"cmdline", cmd)
+		writeFile(t, d+"environ", fmt.Sprintf("ZELLIJ_SESSION_NAME=box-servers\x00ZELLIJ_PANE_ID=%d\x00", paneID))
+	}
+	proc(10, 1, 10, -1, "zellij", "zellij\x00--server\x00", 0)
+	// a script has no job control: the server it runs stays in its process group, the terminal's foreground
+	proc(11, 10, 11, 11, "bash", "/bin/bash\x00./run-panel.sh\x00", 1)
+	proc(950, 11, 11, 11, "control-panel", "./control-panel\x00-cf-team\x00x\x00", 1)
+	proc(960, 950, 11, 11, "gh", "gh\x00api\x00x\x00", 1) // a short call the server makes: newer, but not what the script waits on
+	// an interactive shell at its prompt, a prompt helper briefly in its group: still at the prompt
+	proc(12, 10, 12, 12, "zsh", "zsh\x00-l\x00", 2)
+	proc(951, 12, 12, 12, "git", "git\x00status\x00", 2)
+
+	r := newSysSampler(root).sample(time.Unix(1000, 0), sockScan{})
+	if p := r.panes["pane:box-servers:1"]; p.Root != 11 || p.FgPID != 950 || p.FgComm != "control-panel" || p.FgCmd != "./control-panel -cf-team x" {
+		t.Fatalf("script pane = %+v", p)
+	}
+	if q := r.panes["pane:box-servers:2"]; q.Root != 12 || q.FgPID != 12 {
+		t.Fatalf("interactive shell = %+v", q)
 	}
 }

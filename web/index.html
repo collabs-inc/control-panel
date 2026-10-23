@@ -2,19 +2,44 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0a0c0f">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Panel">
+<meta name="apple-mobile-web-app-title" content="Control Panel">
 <title>Control Panel</title>
+<meta name="description" content="Watch and control the VM: resources, CI, terminals, files and security.">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png"><!-- iOS takes no SVG: the same logo, full-bleed (it rounds the corners) -->
 <link rel="manifest" href="manifest.json" crossorigin="use-credentials">
 <link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="files.css">
+<link rel="stylesheet" href="browser.css">
 <script src="report.js" defer></script>
 <script src="lib.js" defer></script>
 <script src="icons.js" defer></script>
+<script src="orbs.js" defer></script>
 <script src="app.js" defer></script>
+<script src="terms.js" defer></script>
+<script src="files.js" defer></script>
+<script src="browser.js" defer></script>
+<script src="ai-rich.js" defer></script>
+<script src="ai-control.js" defer></script>
+<script src="aurora.js" defer></script>
+<script src="assistant.js" defer></script>
+<!-- the assistant's diagram and chart libraries, loaded the first time a reply needs one (ai-rich.js) -->
+<meta name="lib-mermaid" content="mermaid.min.js">
+<meta name="lib-chart" content="chart.umd.js">
+<meta name="lib-venn" content="chart-venn.js">
+<!-- Files' viewers and editor, each loaded the first time a file needs it (files.js) -->
+<meta name="lib-cm" content="cm.min.js">
+<meta name="lib-pdf" content="pdf.min.mjs">
+<meta name="lib-pdfworker" content="pdf.worker.min.mjs">
+<meta name="lib-xlsx" content="xlsx.full.min.js">
+<meta name="lib-jszip" content="jszip.min.js">
+<meta name="lib-docx" content="docx-preview.min.js">
+<meta name="lib-office" content="office.js">
+<meta name="lib-sheetworker" content="sheet-worker.js">
 </head>
 <body>
 <div id="login" class="login" hidden>
@@ -31,18 +56,23 @@
 <div id="app" class="app" hidden>
   <nav class="nav" aria-label="Sections">
     <i class="glide" aria-hidden="true"></i>
-    <div class="brand"><svg class="i" aria-hidden="true"><use href="#i-wave-pulse"/></svg><span>Control Panel</span></div>
+    <div class="brand"><svg class="i" aria-hidden="true"><use href="#i-wave-pulse-au"/></svg><span>Control Panel</span></div>
+    <button class="nav-btn" data-view="ai" title="J.A.R.V.I.S"><svg class="i" aria-hidden="true"><use href="#i-sparkle"/></svg><span>J.A.R.V.I.S</span><b class="badge" data-badge="ai"></b></button>
     <button class="nav-btn" data-view="res" title="Resources"><svg class="i" aria-hidden="true"><use href="#i-cpu"/></svg><span>Resources</span><b class="badge" data-badge="res"></b></button>
     <button class="nav-btn" data-view="ci" title="CI"><svg class="i" aria-hidden="true"><use href="#i-play-circle3"/></svg><span>CI</span><b class="badge" data-badge="ci"></b></button>
     <button class="nav-btn" data-view="term" title="Terminals"><svg class="i" aria-hidden="true"><use href="#i-terminal-square"/></svg><span>Terminals</span><b class="badge" data-badge="term"></b></button>
+    <button class="nav-btn" data-view="files" title="Files"><svg class="i" aria-hidden="true"><use href="#i-folder-open"/></svg><span>Files</span><b class="badge" data-badge="files"></b></button>
+    <button class="nav-btn" data-view="browser" title="Browser"><svg class="i" aria-hidden="true"><use href="#i-globe"/></svg><span>Browser</span><b class="badge" data-badge="browser"></b></button>
     <button class="nav-btn" data-view="sec" title="Security"><svg class="i" aria-hidden="true"><use href="#i-shield-check"/></svg><span>Security</span><b class="badge" data-badge="sec"></b></button>
     <button id="nav-mini" class="nav-tg" type="button" aria-label="Collapse sidebar" title="Collapse sidebar"><svg class="i" aria-hidden="true"><use href="#i-sidebar-left2"/></svg><span>Collapse</span></button>
+    <button id="nav-keys" class="icon-btn ghost sm nav-keys" type="button" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)"><svg class="i" aria-hidden="true"><use href="#i-keyboard"/></svg></button>
   </nav>
   <main>
     <header class="top">
       <h1 id="title">Resources</h1>
       <div id="top-stats" class="top-stats num"></div>
       <span id="conn" class="conn" role="status" aria-label="connecting"></span>
+      <button type="button" class="icon-btn bell" data-bell aria-haspopup="dialog" aria-expanded="false" aria-label="Notifications" title="Notifications"><svg class="i" aria-hidden="true"><use href="#i-bell"/></svg><span class="bell-n" hidden></span></button>
       <button id="logout" class="icon-btn" aria-label="Lock panel" title="Lock"><svg class="i" aria-hidden="true"><use href="#i-lock-keyhole"/></svg></button>
     </header>
     <section id="view" class="view" aria-live="off"></section>
@@ -60,6 +90,8 @@
     </div>
   </form>
 </dialog>
+<section id="notes" class="notes" role="dialog" aria-label="Notifications" hidden></section>
+<div id="ntoasts" class="ntoasts" role="status" aria-live="polite"></div>
 <div id="drawer" class="drawer" aria-labelledby="dr-title" hidden>
   <header class="dr-head">
     <button id="dr-close" class="icon-btn ghost" aria-label="Back to terminals"><svg class="i" aria-hidden="true"><use href="#i-angle-left"/></svg></button>
@@ -73,12 +105,14 @@
     <div class="seg" role="tablist" aria-label="View">
       <i class="seg-pill" aria-hidden="true"></i><button type="button" data-mode="chat" role="tab"><svg class="i" aria-hidden="true"><use href="#i-chat-round-dots"/></svg><span>Chat</span></button><button type="button" data-mode="screen" role="tab"><svg class="i" aria-hidden="true"><use href="#i-terminal-square"/></svg><span>Terminal</span></button>
     </div>
+    <button type="button" class="icon-btn ghost bell" data-bell aria-haspopup="dialog" aria-expanded="false" aria-label="Notifications" title="Notifications"><svg class="i" aria-hidden="true"><use href="#i-bell"/></svg><span class="bell-n" hidden></span></button>
     <button id="dr-menu" class="icon-btn ghost" type="button" aria-label="More actions" aria-haspopup="menu"><svg class="i" aria-hidden="true"><use href="#i-more-h"/></svg></button>
   </header>
   <div class="dr-main">
     <nav id="dr-rail" class="dr-rail" aria-label="All terminals"><div class="rl-in"><label class="rl-q"><svg class="i" aria-hidden="true"><use href="#i-search"/></svg><input type="search" placeholder="Search terminals" aria-label="Search terminals" autocomplete="off" spellcheck="false"><button type="button" class="rl-hide" aria-label="Hide the terminal list" title="Hide the terminal list"><svg class="i" aria-hidden="true"><use href="#i-sidebar-left2"/></svg></button></label><div class="rl-list"><i class="glide" aria-hidden="true"></i><div class="rl-items"></div></div></div></nav>
     <section class="dr-center">
       <div id="dr-body" class="dr-body" aria-live="off"></div>
+      <canvas id="dr-aurora" class="dr-aurora" aria-hidden="true"></canvas>
       <div id="dr-term" class="dr-term" hidden>
         <pre id="term-sb" class="term sb" aria-label="Terminal history"></pre><pre id="term-pre" class="term" aria-label="Terminal"></pre>
         <textarea id="term-in" class="term-in" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="Type into the terminal"></textarea>
@@ -95,6 +129,7 @@
         <div id="dr-prompt" class="dr-prompt" hidden></div>
         <form id="dr-form" class="composer" autocomplete="off">
           <button type="button" id="dr-down" class="tobottom" aria-label="Jump to the latest" title="Jump to the latest"><svg class="i" aria-hidden="true"><use href="#i-arrow-down"/></svg></button>
+          <aside id="dr-pr" class="prc" aria-label="Pull requests" hidden></aside>
           <div id="dr-cmds" class="cmds" role="listbox" aria-label="Commands" hidden></div>
           <div id="dr-models" class="cmds models" hidden></div>
           <div id="dr-files-chips" class="files" hidden></div>
@@ -103,6 +138,8 @@
             <button type="button" id="dr-attach" class="cbtn" aria-label="Attach files" title="Attach files"><svg class="i" aria-hidden="true"><use href="#i-plus"/></svg></button>
             <button type="button" id="dr-slash" class="cbtn slash" aria-label="Commands" title="Commands (type /)">/</button>
             <button type="button" id="dr-model" class="mpill" aria-haspopup="true" aria-expanded="false" title="Model and effort"><span id="dr-model-t">Model</span><span id="dr-model-b" class="pbars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span></button>
+            <button type="button" id="dr-ctx" class="ctx" aria-haspopup="dialog" aria-expanded="false" hidden><svg class="ctx-r" viewBox="0 0 20 20" aria-hidden="true"><circle class="ctx-bg" cx="10" cy="10" r="7.5" pathLength="100"/><circle class="ctx-fg" cx="10" cy="10" r="7.5" pathLength="100"/></svg><span class="ctx-p"></span><span class="ctx-n"></span></button><span id="dr-compact" class="cmp-w" hidden></span><span id="dr-cost" class="cost" hidden></span>
+            <button type="button" id="dr-clear" class="cbtn cclear" aria-label="Clear" title="Clear what you've written" hidden><svg class="i" aria-hidden="true"><use href="#i-xmark"/></svg></button>
             <button type="submit" id="dr-send" class="cbtn send" aria-label="Send" disabled><svg class="i" aria-hidden="true"><use href="#i-arrow-up"/></svg></button>
           </div>
         </form>
@@ -117,13 +154,22 @@
   <div id="dr-switch" class="dr-switch" hidden><label class="rl-q"><svg class="i" aria-hidden="true"><use href="#i-search"/></svg><input type="search" placeholder="Search terminals" aria-label="Search terminals" autocomplete="off" spellcheck="false"></label><div class="rl-items"></div></div>
 </div>
 
+<dialog id="jump" class="modal jump" aria-label="Jump to a terminal or page">
+  <label class="jump-q"><svg class="i" aria-hidden="true"><use href="#i-search"/></svg><input id="jump-q" type="search" placeholder="Jump to a terminal or page…" autocomplete="off" spellcheck="false" aria-label="Jump to" aria-controls="jump-list" aria-activedescendant=""></label>
+  <div id="jump-list" class="jump-list" role="listbox" aria-label="Terminals and pages"></div>
+  <div class="jump-f"><span><kbd>↑</kbd><kbd>↓</kbd> choose</span><span><kbd>Enter</kbd> open</span><span><kbd>Esc</kbd> close</span></div>
+</dialog>
+<dialog id="keys" class="modal keys" aria-labelledby="keys-t">
+  <div class="modal-h"><h2 id="keys-t">Keyboard shortcuts</h2><span class="spacer"></span><button type="button" class="icon-btn ghost sm" data-keysclose aria-label="Close"><svg class="i" aria-hidden="true"><use href="#i-xmark"/></svg></button></div>
+  <div id="keys-body"></div>
+</dialog>
 <dialog id="newdlg" class="modal">
   <form id="new-form">
     <h2 id="new-title"></h2>
-    <label class="fld"><span>Name</span><input id="new-name" maxlength="64" autocomplete="off" spellcheck="false"></label>
+    <label class="fld"><span>Name</span><input id="new-name" maxlength="64" autocomplete="off" spellcheck="false"><small id="new-slug" class="fld-note" hidden></small></label>
     <label class="fld"><span>Directory</span><select id="new-cwd-sel"></select></label>
     <label class="fld" id="new-cwd-f" hidden><span>Other directory</span><input id="new-cwd" autocomplete="off" spellcheck="false" placeholder="~/path/to/folder"></label>
-    <label class="fld"><span>Start</span><select id="new-run"><option value="shell">Shell</option><option value="claude">Claude</option></select></label>
+    <label class="fld"><span>Start</span><select id="new-run"><option value="shell">Shell</option><option value="claude">Claude (claude-multi)</option></select></label>
     <label class="fld" id="new-dir-f"><span>Split</span><select id="new-dir"><option value="">Auto</option><option value="right">Right</option><option value="down">Down</option></select></label>
     <p id="new-err" class="err" role="alert"></p>
     <div class="modal-actions">
@@ -133,8 +179,10 @@
   </form>
 </dialog>
 <div id="menu" class="menu" role="menu" hidden></div>
+<div id="cpop" class="cpop" role="dialog" aria-label="Context and compacting" hidden></div>
+<div id="tpop" class="menu tpopc" role="dialog" aria-label="Filter" hidden></div>
+<aside id="tpeek" class="tpeek" aria-label="Terminal at a glance" hidden></aside>
 <div id="selbar" class="selbar" hidden><button type="button" data-sel="quote"><svg class="i" aria-hidden="true"><use href="#i-quote-up"/></svg>Quote</button><button type="button" data-sel="copy"><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg>Copy</button></div>
-<div id="toast" class="toast" role="status" hidden></div>
-<button id="update" class="update" type="button" hidden>Panel updated · <b>Reload</b></button>
+<button id="update" class="update" type="button" hidden>New version of the panel ready · <b>Reload</b></button>
 </body>
 </html>

@@ -151,13 +151,53 @@ func (l *auditLog) list() []auditEvent {
 type session struct {
 	email   string
 	expires time.Time
+	saved   time.Time // the expiry sessions.json holds (a sliding one is saved again once it moved an hour)
+}
+
+// Sessions survive a restart (an update of the panel shouldn't ask for the PIN again): sessions.json beside
+// the PIN file holds each one's SHA-256 hash, identity and expiry — not the token, so the file can't be used
+// to log in. Logging out, or 12 h idle, ends one as before.
+func (a *auth) sessFile() string { return filepath.Join(filepath.Dir(a.pinFile), "sessions.json") }
+
+func tokHash(tok string) string { h := sha256.Sum256([]byte(tok)); return hex.EncodeToString(h[:]) }
+
+type savedSession struct {
+	Email   string `json:"email"`
+	Expires int64  `json:"expires"`
+}
+
+func (a *auth) loadSessions() {
+	b, err := os.ReadFile(a.sessFile())
+	if err != nil {
+		return
+	}
+	var m map[string]savedSession
+	if json.Unmarshal(b, &m) != nil {
+		return
+	}
+	now := a.now()
+	for h, v := range m {
+		if exp := time.Unix(v.Expires, 0); exp.After(now) && len(h) == 64 {
+			a.sessions[h] = session{email: v.Email, expires: exp, saved: exp}
+		}
+	}
+}
+
+// saveSessions writes the live sessions; the caller holds a.mu.
+func (a *auth) saveSessions() {
+	m := map[string]savedSession{}
+	for h, v := range a.sessions {
+		m[h] = savedSession{v.email, v.expires.Unix()}
+	}
+	b, _ := json.Marshal(m)
+	writeFileAtomic(a.sessFile(), b, 0o600)
 }
 
 type auth struct {
+	gated   bool
 	pinFile string
 	audit   *auditLog
 	now     func() time.Time
-	gated   bool // -behind-cube: Cube's gate signed the visitor in, so every request is a session
 
 	// ponytail: one global lock and failure counter — single-user panel; per-IP
 	// counters would let an attacker rotate IPs, so global is the stricter choice.
@@ -170,6 +210,7 @@ type auth struct {
 
 func newAuth(pinFile string, audit *auditLog, now func() time.Time) *auth {
 	a := &auth{pinFile: pinFile, audit: audit, now: now, sessions: map[string]session{}}
+	a.loadSessions()
 	for _, e := range audit.list() { // restore the 24 h failure history across restarts
 		if e.Event == "pin-fail" {
 			a.failTimes = append(a.failTimes, time.Unix(e.T, 0))
@@ -238,7 +279,9 @@ func (a *auth) newSession(email string) string {
 			delete(a.sessions, k)
 		}
 	}
-	a.sessions[tok] = session{email: email, expires: now.Add(sessionIdle)}
+	exp := now.Add(sessionIdle)
+	a.sessions[tokHash(tok)] = session{email: email, expires: exp, saved: exp}
+	a.saveSessions()
 	return tok
 }
 
@@ -249,20 +292,29 @@ func (a *auth) validSession(tok, email string) bool {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	s, ok := a.sessions[tok]
+	h := tokHash(tok)
+	s, ok := a.sessions[h]
 	if !ok || tok == "" {
 		return false
 	}
 	now := a.now()
 	if now.After(s.expires) {
-		delete(a.sessions, tok)
+		delete(a.sessions, h)
+		a.saveSessions()
 		return false
 	}
 	if s.email != email {
 		return false
 	}
 	s.expires = now.Add(sessionIdle)
-	a.sessions[tok] = s
+	save := s.expires.Sub(s.saved) > time.Hour
+	if save {
+		s.saved = s.expires
+	}
+	a.sessions[h] = s
+	if save {
+		a.saveSessions()
+	}
 	return true
 }
 
@@ -273,13 +325,14 @@ func (a *auth) peekSession(tok, email string) bool {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	s, ok := a.sessions[tok]
+	s, ok := a.sessions[tokHash(tok)]
 	return ok && tok != "" && s.email == email && !a.now().After(s.expires)
 }
 
 func (a *auth) endSession(tok string) {
 	a.mu.Lock()
-	delete(a.sessions, tok)
+	delete(a.sessions, tokHash(tok))
+	a.saveSessions()
 	a.mu.Unlock()
 }
 

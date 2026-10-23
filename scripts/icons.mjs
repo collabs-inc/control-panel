@@ -2,7 +2,8 @@
 //   cd <scratch> && npm pack reicon@1.2.5 && tar xzf reicon-1.2.5.tgz
 //   curl -sO https://reicon.dev/llms-icons.txt   (kebab -> PascalCase names)
 //   node <panel>/scripts/icons.mjs <scratch> > <panel>/web/icons.js
-// A name ending in "-f" takes the Filled weight; everything else is Outline.
+// A name ending in "-f" takes the Filled weight; everything else is Outline. (web/icons.js also has hand-written
+// parts this template lacks: the aurora gradients, auIcon, br-rect. Add new names' entries by hand.)
 import fs from 'fs';
 import path from 'path';
 
@@ -14,7 +15,9 @@ gauge global hand hard-drive help-circle hierarchy hierarchy3 history image3 inf
 layers layers-alt list-check lock-keyhole maximize microchip minimize more-h paperclip pause3 pen people play-circle3
 play3 plug plus power puzzle quote-up ram receipt-text row-horizontal search server shield-check slash-square
 sidebar-left2 sparkle sparkle-f stop-f stopwatch terminal-square trash2 tuning upload2 wand-sparkle wave-pulse window2
-x-circle x-circle-f xmark`.trim().split(/\s+/);
+x-circle x-circle-f xmark
+monitor mobile tablet moon sun wifi3 bug cursor brush crosshairs globe link eraser camera record-circle magic-wand share signal
+window refresh undo redo text direct-send element code pointer pen-tool message-text export layer comment eye-slash grid4 fullscreen bookmark-check`.trim().split(/\s+/);
 
 const dir = process.argv[2] || '.';
 const pascal = Object.fromEntries(fs.readFileSync(path.join(dir, 'llms-icons.txt'), 'utf8').split('\n')

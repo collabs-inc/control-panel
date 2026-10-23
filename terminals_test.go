@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,7 @@ func TestPaneState(t *testing.T) {
 		{"claude quiet but busy cpu", zPane{}, paneInfo{Root: 11, Comm: "zsh", Agent: "claude", Output: now.Unix() - 1200, CPU: 90}, quiet, nil, 0, "claude", "working", "Bash: sleep"},
 		{"claude permission", zPane{}, paneInfo{Root: 11, Agent: "claude"}, &agentInfo{cp: claudeProc{Status: "waiting", WaitingFor: "permission prompt"}}, nil, 0, "claude", "asking", "permission prompt"},
 		{"claude between turns, its background command running", zPane{}, paneInfo{Root: 11, Agent: "claude", Output: now.Unix() - 1200}, &agentInfo{cp: claudeProc{Status: "shell", Since: now.Unix() - 1200}, tail: tailInfo{mtime: now.Add(-20 * time.Minute)}}, nil, 0, "claude", "background", "Background command running"},
+		{"claude between turns, naming what runs", zPane{}, paneInfo{Root: 11, Agent: "claude"}, &agentInfo{cp: claudeProc{Status: "shell"}, shells: []Shell{{Desc: "Run the tests"}, {Cmd: "tail -f log"}}}, nil, 0, "claude", "background", "In the background: Run the tests and 1 more"},
 		{"claude idle", zPane{}, paneInfo{Root: 11, Agent: "claude"}, &agentInfo{cp: claudeProc{Status: "idle"}, tail: tailInfo{title: "Fix CI"}}, nil, 0, "claude", "waiting", "Fix CI"},
 		{"hook fallback for codex", zPane{}, paneInfo{Root: 11, Agent: "codex"}, nil, &Pane{Activity: "Waiting", AgentKind: "codex", Detail: "approve?"}, 0, "codex", "asking", "approve?"},
 		{"stale hook entry, claude gone", zPane{}, shell, nil, &Pane{Activity: "Thinking", AgentKind: "claude"}, 0, "shell", "idle", ""},
@@ -143,6 +145,19 @@ func TestTermTrackerUpdate(t *testing.T) {
 	if len(f.calls) != n || light.Waiting != 2 || light.Asking != 1 {
 		t.Fatalf("light update: calls=%d counts=%+v", len(f.calls)-n, light)
 	}
+	agents := 0 // the notifications read the agents' states from this update too
+	for _, s := range light.Sessions {
+		for _, tb := range s.Tabs {
+			for _, p := range tb.Panes {
+				if p.Agent != nil && p.Agent.sid != "" && p.Agent.Prompt == nil {
+					agents++
+				}
+			}
+		}
+	}
+	if agents == 0 {
+		t.Fatalf("light update lists no agent panes: %+v", light.Sessions)
+	}
 	if l := tt.labels(); l["pane:dev-1:3"] != "Second · dev-1" {
 		t.Fatalf("labels = %v", l)
 	}
@@ -238,5 +253,17 @@ func TestTermTrackerForegroundProcess(t *testing.T) {
 	ps := tt.update(time.Now(), []string{"s"}, res, func(int) string { return "" }, true).Sessions[0].Tabs[0].Panes
 	if ps[0].Fg != 950 || ps[0].Proc != "python3 train.py" || ps[1].Fg != 0 {
 		t.Fatalf("fg = %d %q / %d", ps[0].Fg, ps[0].Proc, ps[1].Fg)
+	}
+}
+
+func TestAgentNamesNameSessionsByTheirTab(t *testing.T) {
+	tm := Terminals{Sessions: []TSession{{Name: "dev-1", Tabs: []TTab{
+		{Name: "Summit Issue", Panes: []TPane{{ID: 1, Agent: &TAgent{sid: "s1"}}}},
+		{Name: "Two panes", Panes: []TPane{{ID: 2, Title: "left", Agent: &TAgent{sid: "s2"}}, {ID: 3, Agent: &TAgent{sid: "s3"}}, {ID: 4}}},
+	}}}}
+	got := namesOf(tm)
+	want := map[string]string{"s1": "Summit Issue", "s2": "Two panes · left", "s3": "Two panes · pane 3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("names = %v", got)
 	}
 }

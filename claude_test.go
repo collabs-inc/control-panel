@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -48,5 +49,21 @@ func TestReadClaudeSessionsBoundsFields(t *testing.T) {
 	}
 	if got[0].SessionID != "" || len(got[0].Status) > 20 || len(got[0].WaitingFor) > 80 {
 		t.Fatalf("unbounded fields: %+v", got[0])
+	}
+}
+
+func TestStatusLineHandsOverCostAndWindow(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a3f65479-3637-4206-9a5b-220925853da4.json"), []byte(`{"session_id":"a3f65479-3637-4206-9a5b-220925853da4","cost":{"total_cost_usd":807.3249},"context_window":{"context_window_size":1000000,"used_percentage":74}}`), 0o600)
+	c := ccStatus{dir: dir}
+	st := c.of("a3f65479-3637-4206-9a5b-220925853da4")
+	if st.Cost != 807.3249 || st.Window != 1_000_000 {
+		t.Fatalf("status = %+v", st)
+	}
+	if st := c.of("../../etc/passwd"); st != (ccStat{}) {
+		t.Fatalf("a session id that isn't one reads nothing: %+v", st)
+	}
+	if st := c.of("00000000-0000-0000-0000-000000000000"); st != (ccStat{}) {
+		t.Fatalf("no file: nothing: %+v", st)
 	}
 }

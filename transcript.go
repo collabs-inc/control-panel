@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
+	"html"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,6 +30,7 @@ type ChatItem struct {
 	T    int64  `json:"t,omitempty"`
 	Dur  int64  `json:"dur,omitempty"`  // think: seconds since the previous entry
 	In   string `json:"in,omitempty"`   // tool: the full input, for the expanded card
+	Out  string `json:"out,omitempty"`  // note of a monitor's event: what it reported
 	Img  int    `json:"img,omitempty"`  // user: attached images
 	Path string `json:"path,omitempty"` // file tools: the file
 	Add  int    `json:"add,omitempty"`  // edit tools: lines added / removed
@@ -36,6 +39,9 @@ type ChatItem struct {
 	// text: documents the message hands over (named in it, existing, changed lately), shown as file cards
 	Files []string `json:"files,omitempty"`
 	Mid   bool     `json:"mid,omitempty"` // user: sent while Claude was working, taken into the running turn
+	// user: what started the turn when it wasn't you: "peer:<name>" (another Claude session's message), "hook"
+	// (a Stop hook's feedback), "auto" (a scheduled or looping prompt)
+	Via string `json:"via,omitempty"`
 }
 
 type tEntry struct {
@@ -43,6 +49,8 @@ type tEntry struct {
 	Cwd        string          `json:"cwd"`
 	Subtype    string          `json:"subtype"`
 	IsMeta     bool            `json:"isMeta"`
+	IsAPIError bool            `json:"isApiErrorMessage"` // Claude Code's own message for a request that failed for good
+	Sidechain  bool            `json:"isSidechain"`
 	Timestamp  string          `json:"timestamp"`
 	Content    json.RawMessage `json:"content"`
 	DurationMs int64           `json:"durationMs"`
@@ -50,6 +58,9 @@ type tEntry struct {
 	PRNumber   int             `json:"prNumber"`
 	Operation  string          `json:"operation"` // queue-operation: enqueue, dequeue, remove
 	Effort     string          `json:"effort"`    // assistant: the effort level it ran at
+	Compact    struct {
+		PreTokens, PostTokens int64
+	} `json:"compactMetadata"` // system compact_boundary: what the context held before /compact and holds after
 	Attachment struct {
 		Type   string          `json:"type"`
 		Prompt json.RawMessage `json:"prompt"`
@@ -58,7 +69,16 @@ type tEntry struct {
 		Content    json.RawMessage `json:"content"`
 		StopReason string          `json:"stop_reason"`
 		Model      string          `json:"model"`
+		Usage      struct {
+			Input      int64 `json:"input_tokens"`
+			CacheWrite int64 `json:"cache_creation_input_tokens"`
+			CacheRead  int64 `json:"cache_read_input_tokens"`
+		} `json:"usage"`
 	} `json:"message"`
+	Origin *struct {
+		Kind, Name, Body string
+	} `json:"origin"` // who sent a user entry: "human", or "peer" (another Claude session, with its name and words)
+	CompactSummary bool `json:"isCompactSummary"` // the summary a compacted conversation carries on from
 }
 
 type tBlock struct {
@@ -266,12 +286,35 @@ func resultText(raw json.RawMessage) string {
 }
 
 var (
-	summaryRe = regexp.MustCompile(`(?s)<summary>(.*?)</summary>`)
-	cmdNameRe = regexp.MustCompile(`<command-name>(.*?)</command-name>`)
-	stdoutRe  = regexp.MustCompile(`(?s)<local-command-stdout>(.*?)</local-command-stdout>`)
+	summaryRe    = regexp.MustCompile(`(?s)<summary>(.*?)</summary>`)
+	taskStatusRe = regexp.MustCompile(`<status>([a-z_]{1,20})</status>`)
+	eventRe      = regexp.MustCompile(`(?s)<event>(.*?)</event>`)
+	cmdNameRe    = regexp.MustCompile(`<command-name>(.*?)</command-name>`)
+	effortCmdRe  = regexp.MustCompile(`<command-name>/effort</command-name>[\s\S]{0,200}?<command-args>\s*(low|medium|high|xhigh|max)\s*</command-args>`)
+	stdoutRe     = regexp.MustCompile(`(?s)<local-command-stdout>(.*?)</local-command-stdout>`)
+	ansiRe       = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`) // a command's terminal colours (/compact dims its line)
 )
 
+// maxUserText: what you send shows whole (the page folds a long one); past this, a paste is a document.
+const maxUserText = 200 << 10
+
 // userText turns a typed user string into a user item, or a note for harness noise.
+var imgSourceRe = regexp.MustCompile(`^\[Image: source: (.+)\]$`) // Claude Code's note of where an image it attached came from
+
+// imageSources: the paths an entry's "[Image: source: …]" blocks name (all of its text, or nothing).
+func imageSources(content json.RawMessage) []string {
+	_, bs := blocks(content)
+	var out []string
+	for _, b := range bs {
+		m := imgSourceRe.FindStringSubmatch(strings.TrimSpace(b.Text))
+		if b.Type != "text" || m == nil {
+			return nil
+		}
+		out = append(out, m[1])
+	}
+	return out
+}
+
 func userText(s string, t int64) (ChatItem, bool) {
 	ts := strings.TrimSpace(s)
 	switch {
@@ -279,23 +322,49 @@ func userText(s string, t int64) (ChatItem, bool) {
 		return ChatItem{}, false
 	case strings.HasPrefix(ts, "[Request interrupted by user"):
 		return ChatItem{K: "note", Text: "Interrupted", T: t}, true
-	case strings.HasPrefix(ts, "<task-notification>"):
-		if m := summaryRe.FindStringSubmatch(ts); m != nil {
-			return ChatItem{K: "note", Text: trunc(strings.TrimSpace(m[1]), 300), T: t}, true
+	case strings.HasPrefix(ts, "<task-notification>"): // Claude Code telling the agent a background task moved: a note, with how it went
+		name := "task:event" // a monitor's event: no status
+		if m := taskStatusRe.FindStringSubmatch(ts); m != nil {
+			name = "task:" + m[1]
 		}
-		return ChatItem{K: "note", Text: "Background task finished", T: t}, true
+		if m := summaryRe.FindStringSubmatch(ts); m != nil {
+			it := ChatItem{K: "note", Name: name, Text: trunc(html.UnescapeString(strings.TrimSpace(m[1])), 300), T: t}
+			if ev := eventRe.FindStringSubmatch(ts); ev != nil {
+				it.Out = trunc(html.UnescapeString(strings.TrimSpace(ev[1])), 600)
+			}
+			return it, true
+		}
+		return ChatItem{K: "note", Name: name, Text: "Background task finished", T: t}, true
+	case ts == compactCmd: // the compactor's: the "Compacted" line says it
+		return ChatItem{}, false
 	case strings.Contains(ts, "<command-name>"):
-		if m := cmdNameRe.FindStringSubmatch(ts); m != nil {
+		if m := cmdNameRe.FindStringSubmatch(ts); m != nil && m[1] == "/compact" { // the "Compacted" line says it
+			return ChatItem{}, false
+		} else if m != nil {
 			return ChatItem{K: "note", Text: trunc(m[1], 100), T: t}, true
 		}
 		return ChatItem{}, false
 	case strings.HasPrefix(ts, "<local-command-stdout>"):
-		if m := stdoutRe.FindStringSubmatch(ts); m != nil && strings.TrimSpace(m[1]) != "" {
-			return ChatItem{K: "note", Text: trunc(strings.TrimSpace(m[1]), 300), T: t}, true
+		if m := stdoutRe.FindStringSubmatch(ts); m != nil && strings.TrimSpace(m[1]) != "" && !strings.HasPrefix(ansiRe.ReplaceAllString(m[1], ""), "Compacted") {
+			return ChatItem{K: "note", Text: trunc(strings.TrimSpace(ansiRe.ReplaceAllString(m[1], "")), 300), T: t}, true
 		}
 		return ChatItem{}, false
 	}
-	return ChatItem{K: "user", Text: trunc(ts, 8000), T: t}, true
+	if rest, ok := strings.CutPrefix(ts, panelMark); ok { // the compactor's note or its "continue"
+		return ChatItem{K: "user", Text: trunc(strings.TrimSpace(rest), maxUserText), Via: "panel", T: t}, true
+	}
+	return ChatItem{K: "user", Text: trunc(ts, maxUserText), T: t}, true
+}
+
+// fmtTok: 612k, 1.2M.
+func fmtTok(n int64) string {
+	switch {
+	case n >= 1e6:
+		return strconv.FormatFloat(float64(n)/1e6, 'f', 1, 64) + "M"
+	case n >= 1000:
+		return strconv.FormatInt((n+500)/1000, 10) + "k"
+	}
+	return strconv.FormatInt(n, 10)
 }
 
 func unixOf(ts string) int64 {
@@ -330,7 +399,26 @@ func fmtDur(s int64) string {
 }
 
 // parseChat converts transcript lines to chat items; title is the newest ai-title seen.
-func parseChat(lines [][]byte) (items []ChatItem, title string) {
+func parseChat(lines [][]byte) (items []ChatItem, title string) { return parseChatOpen(lines, false) }
+
+// turnOpen: is a turn under way after these items (else open, when they say nothing): a turn ends with its
+// "Worked for" note. The live chat parses each new batch of lines on its own and carries this across.
+func turnOpen(items []ChatItem, open bool) bool {
+	for i := len(items) - 1; i >= 0; i-- {
+		switch it := items[i]; {
+		case it.K == "queue" || it.K == "model":
+		case it.K == "note" && strings.HasPrefix(it.Text, "Worked for "):
+			return false
+		default:
+			return true
+		}
+	}
+	return open
+}
+
+// parseChatOpen parses lines that may begin inside a turn (open): a hidden entry then rides along, it doesn't
+// start one.
+func parseChatOpen(lines [][]byte, open bool) (items []ChatItem, title string) {
 	var lastT int64 // the previous timestamped entry: thinking ran from there to its own timestamp
 	var model, effort string
 	for _, l := range lines {
@@ -347,11 +435,14 @@ func parseChat(lines [][]byte) (items []ChatItem, title string) {
 		case "queue-operation": // messages typed while Claude works wait in a queue until it takes them
 			var c string
 			json.Unmarshal(e.Content, &c)
-			items = append(items, ChatItem{K: "queue", Name: trunc(e.Operation, 20), Text: trunc(c, 4000), T: t})
+			items = append(items, ChatItem{K: "queue", Name: trunc(e.Operation, 20), Text: trunc(c, maxUserText), T: t})
 		case "attachment": // a queued message Claude took into the turn it was working on
 			var p string
 			if e.Attachment.Type == "queued_command" && json.Unmarshal(e.Attachment.Prompt, &p) == nil && strings.TrimSpace(p) != "" {
-				items = append(items, ChatItem{K: "user", Text: trunc(strings.TrimSpace(p), 8000), T: t, Mid: true})
+				if it, ok := userText(p, t); ok { // yours, taken mid-turn; or a task's notice, which is a note
+					it.Mid = it.K == "user"
+					items = append(items, it)
+				}
 			}
 		case "ai-title":
 			if e.AITitle != "" {
@@ -367,23 +458,56 @@ func parseChat(lines [][]byte) (items []ChatItem, title string) {
 			switch e.Subtype {
 			case "turn_duration":
 				items = append(items, ChatItem{K: "note", Text: "Worked for " + fmtDur(e.DurationMs/1000), T: t})
+				open = false
 			case "compact_boundary", "away_summary", "informational":
+				if e.Subtype == "compact_boundary" && e.Compact.PreTokens > 0 && e.Compact.PostTokens > 0 {
+					c = "Compacted " + fmtTok(e.Compact.PreTokens) + " → " + fmtTok(e.Compact.PostTokens)
+				}
 				if c != "" {
 					items = append(items, ChatItem{K: "note", Text: trunc(c, 300), T: t})
 				}
 			}
 		case "user":
-			if e.IsMeta {
+			if e.IsMeta { // Claude Code's own; one kind rides on the message before it: where the images it attached came from
+				if !open { // between turns it's what starts the next one: another session's message, a scheduled prompt, a hook
+					if it, ok := triggerItem(e, t); ok {
+						items = append(items, it)
+						open = true
+						continue
+					}
+				}
+				if srcs := imageSources(e.Message.Content); len(srcs) > 0 {
+					for i := len(items) - 1; i >= 0; i-- {
+						if items[i].K == "user" {
+							items[i].Text = strings.TrimSpace(items[i].Text + "\n" + strings.Join(srcs, "\n"))
+							break
+						}
+					}
+				}
 				continue
 			}
+			open = true
 			text, bs := blocks(e.Message.Content)
+			if e.CompactSummary { // not something you wrote: what Claude kept, after the "Compacted" line
+				items = append(items, ChatItem{K: "user", Text: trunc(strings.TrimSpace(text), maxUserText), Via: "summary", T: t})
+				continue
+			}
 			if it, ok := userText(text, t); ok {
 				items = append(items, it)
 			}
+			if m := effortCmdRe.FindStringSubmatch(text); m != nil && model != "" && m[1] != effort { // it applies now; the next reply only confirms it
+				effort = m[1]
+				items = append(items, ChatItem{K: "model", Text: trunc(model, 80), Name: effort, T: t})
+			}
 			imgs, firstUser := 0, -1
+			var srcs []string // where the images Claude Code attached came from (a path you pasted): they ride on the message
 			for _, b := range bs {
 				switch b.Type {
 				case "text":
+					if m := imgSourceRe.FindStringSubmatch(strings.TrimSpace(b.Text)); m != nil {
+						srcs = append(srcs, m[1])
+						continue
+					}
 					if it, ok := userText(b.Text, t); ok {
 						if it.K == "user" && firstUser < 0 {
 							firstUser = len(items)
@@ -396,14 +520,18 @@ func parseChat(lines [][]byte) (items []ChatItem, title string) {
 					items = append(items, ChatItem{K: "result", ID: b.ToolUseID, Text: resultText(b.Content), Err: b.IsError, T: t})
 				}
 			}
-			if imgs > 0 { // images ride on the message they came with
+			if imgs > 0 || len(srcs) > 0 { // images ride on the message they came with (the page shows the uploads among them)
 				if firstUser < 0 {
 					firstUser = len(items)
 					items = append(items, ChatItem{K: "user", T: t})
 				}
 				items[firstUser].Img = imgs
+				if len(srcs) > 0 {
+					items[firstUser].Text = strings.TrimSpace(items[firstUser].Text + "\n" + strings.Join(srcs, "\n"))
+				}
 			}
 		case "assistant":
+			open = true
 			if m := e.Message.Model; m != "" && m != "<synthetic>" && (m != model || e.Effort != effort) { // what it runs on, when that changes
 				model, effort = m, e.Effort
 				items = append(items, ChatItem{K: "model", Text: trunc(m, 80), Name: trunc(e.Effort, 20), T: t})
@@ -437,6 +565,30 @@ func parseChat(lines [][]byte) (items []ChatItem, title string) {
 	return newPRs(items, new(string)), title
 }
 
+// triggerItem: a hidden (isMeta) user entry that starts a turn, shown as what started it. What only rides along
+// (an image's details, a command's caveat, a system reminder, a skill's text) isn't one.
+func triggerItem(e tEntry, t int64) (ChatItem, bool) {
+	if e.Origin != nil && e.Origin.Kind == "peer" {
+		body := strings.TrimSpace(e.Origin.Body)
+		if body == "" {
+			body, _ = blocks(e.Message.Content)
+		}
+		return ChatItem{K: "user", Text: trunc(strings.TrimSpace(body), maxUserText), Via: "peer:" + trunc(e.Origin.Name, 40), T: t}, true
+	}
+	text, _ := blocks(e.Message.Content)
+	ts := strings.TrimSpace(text)
+	for _, p := range []string{"[Image", "<local-command", "<system-reminder>", "<command-", "Base directory for this skill", "Caveat:", "[Your previous response"} {
+		if ts == "" || strings.HasPrefix(ts, p) {
+			return ChatItem{}, false
+		}
+	}
+	via := "auto"
+	if strings.HasPrefix(ts, "Stop hook feedback") {
+		via = "hook"
+	}
+	return ChatItem{K: "user", Text: trunc(ts, maxUserText), Via: via, T: t}, true
+}
+
 // newPRs drops PR notes that repeat the PR already shown (Claude re-records the session's linked PR after
 // many of its commands; one transcript had 882 of them) and remembers the last one shown in *last.
 func newPRs(items []ChatItem, last *string) []ChatItem {
@@ -465,18 +617,25 @@ func lastTurn(lines [][]byte) (doing string, final bool) {
 		if e.Type == "user" {
 			for _, b := range bs {
 				text += b.Text
+				if b.Type == "tool_result" && bytes.HasPrefix(bytes.Trim(b.Content, `"`), []byte("Structured output provided successfully")) {
+					return "", true // a workflow agent hands back its result and ends there, with no closing reply
+				}
 			}
 			if strings.HasPrefix(strings.TrimSpace(text), "[Request interrupted by user") {
 				return "", true
 			}
 			return "Thinking", false
 		}
+		if e.IsAPIError { // an API error or a refusal ends the turn: nothing follows it
+			return "", true
+		}
 		for j := len(bs) - 1; j >= 0; j-- {
 			if bs[j].Type == "tool_use" {
 				return trunc(bs[j].Name, 60) + ": " + toolSummary(bs[j].Name, bs[j].Input), false
 			}
 		}
-		if e.Message.StopReason == "end_turn" || e.Message.StopReason == "stop_sequence" {
+		switch e.Message.StopReason {
+		case "end_turn", "stop_sequence", "refusal":
 			return "", true
 		}
 		for _, b := range bs {
@@ -487,6 +646,42 @@ func lastTurn(lines [][]byte) (doing string, final bool) {
 		return "Thinking", false
 	}
 	return "", false
+}
+
+// contextUse is how much of the context window the latest request filled, the way Claude Code counts it
+// for its status line: input + cache-write + cache-read tokens of the last real (not synthetic, not a
+// subagent's) response.
+func contextUse(lines [][]byte) (used int64, model string) {
+	for i := len(lines) - 1; i >= 0; i-- {
+		var e tEntry
+		if json.Unmarshal(lines[i], &e) != nil {
+			continue
+		}
+		if e.Type == "system" && e.Subtype == "compact_boundary" && used == 0 && e.Compact.PostTokens > 0 {
+			used = e.Compact.PostTokens // no request since /compact: the compacted size; the model is still the last one's
+			continue
+		}
+		if e.Type != "assistant" || e.Sidechain || e.IsAPIError || e.Message.Model == "<synthetic>" {
+			continue
+		}
+		u := e.Message.Usage
+		if n := u.Input + u.CacheWrite + u.CacheRead; n > 0 {
+			return cmp.Or(used, n), e.Message.Model
+		}
+	}
+	return used, ""
+}
+
+// contextWindow: the Claude 5 models and any "[1m]" model run with a 1M window; others 200k. Claude Code
+// takes the size from a model catalog it fetches; seen in these transcripts: Opus 5.5 up to 967k tokens,
+// Sonnet 5.5 311k, Haiku 4.5 43k. A request that used more than 200k proves the bigger window anyway.
+func contextWindow(model string, used int64) int64 {
+	m := strings.ToLower(model)
+	if strings.Contains(m, "[1m]") || strings.HasPrefix(m, "claude-opus-5") || strings.HasPrefix(m, "claude-sonnet-5") ||
+		strings.HasPrefix(m, "claude-fable-5") || used > 200_000 {
+		return 1_000_000
+	}
+	return 200_000
 }
 
 // ---- reading jsonl files by byte range; only complete lines are returned ----
@@ -536,8 +731,7 @@ func tailChat(lines [][]byte, start int64, n int, since int64) (items []ChatItem
 		before = start
 	}
 	items, _ = parseChat(lines[i:]) // in one pass, so thinking gets its duration
-	_, title = parseChat(lines)
-	return items, before, title
+	return items, before, newestTitle(lines)
 }
 
 func readRange(path string, from, to int64) []byte {
@@ -617,6 +811,7 @@ type transcripts struct {
 	mu    sync.Mutex
 	paths map[string]string
 	tails map[string]tailInfo
+	prs   prScans // every PR each session linked
 }
 
 type tailInfo struct {
@@ -625,6 +820,15 @@ type tailInfo struct {
 	doing string
 	final bool
 	title string
+	ctx   int64 // tokens the latest request filled
+	model string
+	cwd   string // where its shell is now: Claude Code writes it on every entry, and a `cd` moves it
+	// Claude's last words: the Terminals page reads in them what a stopped agent needs from you
+	claude   string
+	claudeAt int64
+	asks     bool  // and they end by asking you something
+	deep     bool  // looked past the last 256 KB for them once
+	compacts int64 // when it was last compacted (unix)
 }
 
 func newTranscripts(root string) *transcripts {
@@ -671,15 +875,84 @@ func (t *transcripts) tail(sid string) (tailInfo, string) {
 	if len(ls) == 0 { // one huge line at the end (a big tool result)
 		ls, _, _ = readTail(p, 8<<20)
 	}
-	ti := tailInfo{size: fi.Size(), mtime: fi.ModTime(), title: old.title}
+	ti := tailInfo{size: fi.Size(), mtime: fi.ModTime(), title: old.title, ctx: old.ctx, model: old.model, cwd: old.cwd,
+		claude: old.claude, claudeAt: old.claudeAt, asks: old.asks, deep: old.deep, compacts: old.compacts}
 	ti.doing, ti.final = lastTurn(ls)
-	if _, title := parseChat(ls); title != "" {
+	for i := len(ls) - 1; i >= 0; i-- {
+		var e tEntry
+		if json.Unmarshal(ls[i], &e) == nil && e.Cwd != "" && !e.Sidechain {
+			ti.cwd = e.Cwd
+			break
+		}
+	}
+	for i := len(ls) - 1; i >= 0; i-- {
+		var e tEntry
+		if bytes.Contains(ls[i], []byte(`"compact_boundary"`)) && json.Unmarshal(ls[i], &e) == nil && e.Subtype == "compact_boundary" {
+			ti.compacts = max(ti.compacts, unixOf(e.Timestamp))
+			break
+		}
+	}
+	if n, m := contextUse(ls); n > 0 { // not in the last 256 KB (one huge tool result): keep the last known
+		ti.ctx, ti.model = n, cmp.Or(m, ti.model)
+	}
+	if title := newestTitle(ls); title != "" {
 		ti.title = title
+	}
+	ti.latest(ls)
+	// a long run of tool calls (a few image reads fill 256 KB) can hide the last words: look further back, once
+	if !old.deep && ti.claude == "" {
+		ti.deep = true
+		if big, _, _ := readTail(p, 8<<20); len(big) > len(ls) {
+			ti.latest(big)
+		}
 	}
 	t.mu.Lock()
 	t.tails[sid] = ti
 	t.mu.Unlock()
 	return ti, p
+}
+
+// latest keeps Claude's newest words in lines (the older value stays when they have none): parseChat's last text
+// item, found from the end instead of parsing every line.
+func (ti *tailInfo) latest(lines [][]byte) {
+	for i := len(lines) - 1; i >= 0; i-- {
+		var e tEntry
+		if !bytes.Contains(lines[i], []byte(`"assistant"`)) || json.Unmarshal(lines[i], &e) != nil || e.Type != "assistant" {
+			continue
+		}
+		_, bs := blocks(e.Message.Content)
+		for j := len(bs) - 1; j >= 0; j-- {
+			if s := strings.TrimSpace(bs[j].Text); bs[j].Type == "text" && s != "" {
+				text := trunc(s, 16000) // as parseChat's item holds it
+				ti.claude, ti.claudeAt, ti.asks = trunc(text, 1500), unixOf(e.Timestamp), asksYou(text)
+				return
+			}
+		}
+	}
+}
+
+// newestTitle is parseChat's title (the newest non-empty ai-title), found from the end.
+func newestTitle(lines [][]byte) string {
+	for i := len(lines) - 1; i >= 0; i-- {
+		var e tEntry
+		if bytes.Contains(lines[i], []byte(`"ai-title"`)) && json.Unmarshal(lines[i], &e) == nil && e.Type == "ai-title" && e.AITitle != "" {
+			return trunc(e.AITitle, 120)
+		}
+	}
+	return ""
+}
+
+var (
+	askRe   = regexp.MustCompile(`(?i)\b(should I|want me to|shall I|let me know|your call|do you want|which one|approve|confirm)\b`)
+	blockRe = regexp.MustCompile(`(?i)\b(can'?t|cannot|won'?t|unable to)\b[^.]*\buntil you\b|\bblocked\b|\bneeds? you to\b|\brequires? you\b|\bonly you can\b`)
+)
+
+// asksYou: whether a reply ends by asking you something (a question, "want me to…", or it can't go on without
+// you), as the page's askOf reads it, from its last few lines: the compactor waits for your answer then.
+func asksYou(text string) bool {
+	r := []rune(strings.TrimSpace(text))
+	t := string(r[max(0, len(r)-400):])
+	return strings.Contains(t, "?") || askRe.MatchString(t) || blockRe.MatchString(t)
 }
 
 // ---- subagents ----
@@ -694,11 +967,180 @@ type Subagent struct {
 	Doing   string `json:"doing"`
 	Started int64  `json:"started"`
 	Active  int64  `json:"active"`
+	WF      string `json:"wf,omitempty"`    // the workflow run it belongs to (wf_…), if any
+	Phase   string `json:"phase,omitempty"` // its phase in that workflow
+	path    string // its transcript: its own background commands are read from it
+}
+
+// Workflow is a Claude Code workflow run of a session that is still going: its agents' transcripts sit in
+// <session>/subagents/workflows/<run>/, and <session>/workflows/<run>.json appears once it finishes.
+type Workflow struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Done    int    `json:"done"`  // agents that finished
+	Total   int    `json:"total"` // agents started so far
+	Started int64  `json:"started"`
 }
 
 type subagentCache struct {
-	mu sync.Mutex
-	m  map[string]subEntry
+	mu   sync.Mutex
+	m    map[string]subEntry
+	done map[string]int64     // a workflow agent seen finished, at this size: it doesn't resume, so no re-read
+	ends map[string]*taskEnds // per parent transcript
+}
+
+// taskEnds: the background tasks a parent transcript has been told ended, and the background commands
+// and monitors it started, read up to off.
+type taskEnds struct {
+	off   int64
+	ids   map[string]bool  // ended
+	calls map[string]Shell // background tool calls waiting for their result, by tool_use id
+	runs  map[string]Shell // started and not ended, by task id
+}
+
+// Shell is a background command (Bash with run_in_background) or a Monitor a session started: what keeps
+// Claude Code's status at "shell" after a turn.
+type Shell struct {
+	ID      string `json:"id"`
+	Kind    string `json:"kind"` // command, monitor
+	Desc    string `json:"desc"`
+	Cmd     string `json:"cmd,omitempty"`
+	Started int64  `json:"started"`
+	until   int64  // a monitor's timeout (0: none)
+}
+
+// Claude Code tells a session a background task ended with a <task-notification> in its transcript;
+// for a subagent the task id is the subagent's id.
+var bgTextRe = regexp.MustCompile(`Monitor started \(task ([A-Za-z0-9_-]{1,64})(?:, expires in (\d+)m)?|running in background with ID: ([A-Za-z0-9_-]{1,64})`)
+
+var taskNoteRe = regexp.MustCompile(`<task-id>([A-Za-z0-9_-]{1,64})</task-id>.{0,800}?<status>([a-z_]{1,20})</status>`)
+
+// ended reads what was appended to the parent transcript since the last call (on the first, its last
+// 8 MB) for task notifications with a final status. The caller holds c.mu.
+// ponytail: one entry per parent transcript seen, never dropped; a few bytes each.
+func (c *subagentCache) ended(parent string) map[string]bool {
+	fi, err := os.Stat(parent)
+	if err != nil {
+		return nil
+	}
+	if c.ends == nil {
+		c.ends = map[string]*taskEnds{}
+	}
+	te := c.ends[parent]
+	if te == nil || fi.Size() < te.off { // new, or rewritten
+		te = &taskEnds{off: max(0, fi.Size()-8<<20), ids: map[string]bool{}, calls: map[string]Shell{}, runs: map[string]Shell{}}
+		c.ends[parent] = te
+	}
+	ls, next := readFrom(parent, te.off)
+	for _, l := range ls {
+		te.started(l)
+		for _, m := range taskNoteRe.FindAllSubmatch(l, -1) {
+			switch string(m[2]) {
+			case "running", "pending", "queued", "started":
+			default:
+				te.ids[string(m[1])] = true
+				delete(te.runs, string(m[1]))
+			}
+		}
+	}
+	te.off = next
+	return te.ids
+}
+
+// started notes a background Bash or Monitor call, and the task id its result gives it.
+func (te *taskEnds) started(l []byte) {
+	call := bytes.Contains(l, []byte(`"run_in_background":true`)) || bytes.Contains(l, []byte(`"name":"Monitor"`))
+	res := bytes.Contains(l, []byte(`"backgroundTaskId"`)) || bytes.Contains(l, []byte(`"taskId"`)) ||
+		bytes.Contains(l, []byte("Monitor started (task ")) || bytes.Contains(l, []byte("running in background with ID: ")) // a subagent's results carry only the text
+	if !call && !res {
+		return
+	}
+	var e struct {
+		Timestamp string
+		Message   struct{ Content json.RawMessage }
+		R         struct {
+			BackgroundTaskID string `json:"backgroundTaskId"`
+			TaskID           string `json:"taskId"`
+			TimeoutMs        int64  `json:"timeoutMs"`
+			Persistent       bool
+		} `json:"toolUseResult"`
+	}
+	if json.Unmarshal(l, &e) != nil {
+		return
+	}
+	var cs []struct {
+		Type, ID, Name string
+		ToolUseID      string          `json:"tool_use_id"`
+		Content        json.RawMessage `json:"content"`
+		Input          struct {
+			Command, Description string
+			RunInBackground      bool `json:"run_in_background"`
+		}
+	}
+	json.Unmarshal(e.Message.Content, &cs)
+	at := unixOf(e.Timestamp)
+	for _, c := range cs {
+		switch {
+		case c.Type == "tool_use" && (c.Name == "Monitor" || c.Name == "Bash" && c.Input.RunInBackground):
+			kind := map[string]string{"Bash": "command", "Monitor": "monitor"}[c.Name]
+			te.calls[c.ID] = Shell{Kind: kind, Desc: trunc(c.Input.Description, 120), Cmd: trunc(c.Input.Command, 300), Started: at}
+		case c.Type == "tool_result" && res:
+			sh, ok := te.calls[c.ToolUseID]
+			delete(te.calls, c.ToolUseID)
+			id := e.R.BackgroundTaskID
+			if sh.Kind == "monitor" {
+				id = e.R.TaskID
+			}
+			if id == "" { // a subagent's transcript: the id (and a monitor's expiry) only in the result's text
+				if m := bgTextRe.FindSubmatch(c.Content); m != nil {
+					id = string(m[1]) + string(m[3])
+					if mins, _ := strconv.Atoi(string(m[2])); mins > 0 && sh.Kind == "monitor" {
+						e.R.TimeoutMs = int64(mins) * 60_000
+					}
+				}
+			}
+			if !subIDRe.MatchString(id) || te.ids[id] {
+				continue
+			}
+			if !ok { // a command you backgrounded by hand (Ctrl+B)
+				sh = Shell{Kind: "command", Desc: "Background command", Started: at}
+			}
+			if sh.Started == 0 {
+				sh.Started = at
+			}
+			if sh.Kind == "monitor" && !e.R.Persistent && e.R.TimeoutMs > 0 {
+				sh.until = sh.Started + e.R.TimeoutMs/1000
+			}
+			sh.ID = id
+			te.runs[id] = sh
+		}
+	}
+}
+
+// shells lists the background commands and monitors still running in a session (oldest first): started
+// by this Claude process (procStart: a resumed session's old tasks died with the old one), not ended,
+// and a monitor not past its timeout. The caller asks only while Claude says something runs (not idle).
+func (c *subagentCache) shells(parent string, procStart int64, now time.Time) []Shell {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ended(parent)
+	te := c.ends[parent]
+	if te == nil {
+		return nil
+	}
+	var out []Shell
+	for _, sh := range te.runs {
+		if sh.Started >= procStart && (sh.until == 0 || now.Unix() < sh.until) {
+			out = append(out, sh)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Started != out[j].Started {
+			return out[i].Started < out[j].Started
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
 }
 
 type subEntry struct {
@@ -711,15 +1153,28 @@ type subEntry struct {
 // ponytail: a subagent whose transcript hasn't moved for 60 min drops off (a tool call that long, or an abandoned one).
 const subagentQuiet = 60 * time.Minute
 
-// list returns the running subagents in dir (<transcript dir>/<sessionId>/subagents), oldest first.
-// Running: its last turn isn't finished and it wrote within subagentQuiet. The caller checks the parent is alive.
-func (c *subagentCache) list(dir string, now time.Time) []Subagent {
+// list returns the running subagents of a session (<its transcript, less .jsonl>/subagents), oldest first.
+// Running: its last turn isn't finished, it wrote within subagentQuiet, the session wasn't told it ended
+// (background ones), and the session is in a turn (foreground ones: the turn waits on them, so a
+// subagent left mid-tool by an interrupt is over once the session is idle). The caller checks the
+// parent is alive.
+func (c *subagentCache) list(parent string, parentInTurn bool, now time.Time) []Subagent {
+	sess := strings.TrimSuffix(parent, ".jsonl")
+	dir := filepath.Join(sess, "subagents")
 	files, _ := filepath.Glob(filepath.Join(dir, "agent-*.jsonl"))
+	wfDirs, _ := filepath.Glob(filepath.Join(dir, "workflows", "wf_*"))
+	for _, d := range wfDirs { // a finished run's agents are never listed (below): don't stat them every tick
+		if !wfFinished(sess, filepath.Base(d)) {
+			wf, _ := filepath.Glob(filepath.Join(d, "agent-*.jsonl"))
+			files = append(files, wf...)
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.m == nil {
 		c.m = map[string]subEntry{}
 	}
+	ended := c.ended(parent)
 	var out []Subagent
 	for _, p := range files {
 		fi, err := os.Stat(p)
@@ -731,12 +1186,17 @@ func (c *subagentCache) list(dir string, now time.Time) []Subagent {
 			id := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(p), "agent-"), ".jsonl")
 			e = subEntry{size: fi.Size(), mtime: fi.ModTime(), sub: Subagent{ID: trunc(id, 40), Active: fi.ModTime().Unix()}}
 			metaPath := strings.TrimSuffix(p, ".jsonl") + ".meta.json"
-			var meta struct{ AgentType, Description, Model, RequestShape string }
+			var meta struct{ AgentType, Description, Model, RequestShape, WorkflowPhase string }
 			if b, err := os.ReadFile(metaPath); err == nil {
 				json.Unmarshal(b, &meta)
 			}
 			e.sub.Desc, e.sub.Type, e.sub.Model = trunc(meta.Description, 120), trunc(meta.AgentType, 40), trunc(meta.Model, 40)
 			e.sub.BG = meta.RequestShape == "background"
+			if wf := filepath.Base(filepath.Dir(p)); filepath.Base(filepath.Dir(filepath.Dir(p))) == "workflows" {
+				e.sub.WF, e.sub.Phase = trunc(wf, 40), trunc(meta.WorkflowPhase, 60)
+				e.sub.BG = true // a workflow runs on its own, whatever the parent's turn does
+			}
+			e.sub.path = p
 			e.sub.Started = e.sub.Active
 			if mfi, err := os.Stat(metaPath); err == nil {
 				e.sub.Started = mfi.ModTime().Unix()
@@ -748,7 +1208,7 @@ func (c *subagentCache) list(dir string, now time.Time) []Subagent {
 			e.sub.Doing, e.final = lastTurn(ls)
 			c.m[p] = e
 		}
-		if !e.final {
+		if !e.final && !ended[e.sub.ID] && (e.sub.BG || parentInTurn) && !(e.sub.WF != "" && wfFinished(sess, e.sub.WF)) {
 			out = append(out, e.sub)
 		}
 	}
@@ -763,6 +1223,75 @@ func (c *subagentCache) list(dir string, now time.Time) []Subagent {
 		}
 		return out[i].ID < out[j].ID
 	})
+	return out
+}
+
+func wfFinished(sess, wf string) bool {
+	_, err := os.Stat(filepath.Join(sess, "workflows", wf+".json"))
+	return err == nil
+}
+
+// workflows lists a session's workflow runs still going: not finished, an agent active within
+// subagentQuiet, not every agent done. The name comes from its script, which Claude Code keeps under
+// whichever project folder the session was in when it started it. Call after list (it reuses its reads).
+func (c *subagentCache) workflows(parent string, now time.Time) []Workflow {
+	sess := strings.TrimSuffix(parent, ".jsonl")
+	dirs, _ := filepath.Glob(filepath.Join(sess, "subagents", "workflows", "wf_*"))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []Workflow
+	for _, d := range dirs {
+		id := filepath.Base(d)
+		if wfFinished(sess, id) {
+			continue
+		}
+		files, _ := filepath.Glob(filepath.Join(d, "agent-*.jsonl"))
+		w := Workflow{ID: trunc(id, 40), Name: id, Total: len(files)}
+		active := false // a stat each first: an abandoned run (no summary, all quiet) costs no reads
+		for _, p := range files {
+			if fi, err := os.Stat(p); err == nil && now.Sub(fi.ModTime()) <= subagentQuiet {
+				active = true
+				break
+			}
+		}
+		if !active {
+			continue
+		}
+		for _, p := range files {
+			fi, err := os.Stat(p)
+			if err != nil {
+				continue
+			}
+			if c.done == nil {
+				c.done = map[string]int64{}
+			}
+			final := c.done[p] == fi.Size()
+			if !final {
+				e, ok := c.m[p] // list read the active ones
+				if !ok || e.size != fi.Size() {
+					ls, _, _ := readTail(p, 256<<10)
+					_, e.final = lastTurn(ls)
+				}
+				if final = e.final; final {
+					c.done[p] = fi.Size()
+				}
+			}
+			if final {
+				w.Done++
+			}
+			if mfi, err := os.Stat(strings.TrimSuffix(p, ".jsonl") + ".meta.json"); err == nil && (w.Started == 0 || mfi.ModTime().Unix() < w.Started) {
+				w.Started = mfi.ModTime().Unix()
+			}
+		}
+		if w.Done == w.Total {
+			continue
+		}
+		if m, _ := filepath.Glob(filepath.Join(filepath.Dir(filepath.Dir(sess)), "*", filepath.Base(sess), "workflows", "scripts", "*-"+id+".js")); len(m) > 0 {
+			w.Name = trunc(strings.TrimSuffix(filepath.Base(m[0]), "-"+id+".js"), 80)
+		}
+		out = append(out, w)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Started < out[j].Started })
 	return out
 }
 
@@ -796,6 +1325,12 @@ func subagentPath(parent, id, tool string) (string, Subagent, error) {
 	}
 	p := filepath.Join(dir, "agent-"+id+".jsonl")
 	fi, err := os.Stat(p)
+	if err != nil { // a workflow's agent: one folder down (the id is a plain token, so the glob can't walk out)
+		if w, _ := filepath.Glob(filepath.Join(dir, "workflows", "wf_*", "agent-"+id+".jsonl")); len(w) > 0 {
+			p = w[0]
+			fi, err = os.Stat(p)
+		}
+	}
 	if err != nil {
 		return "", m, errors.New("no such subagent")
 	}
@@ -811,7 +1346,7 @@ func subagentPath(parent, id, tool string) (string, Subagent, error) {
 // ---- files a message hands over ----
 
 var (
-	docFileRe = regexp.MustCompile(`^[\w@%+=~./-]*[\w@%+=-]\.(?i:html?|md|markdown|pdf|png|jpe?g|gif|webp|svg|csv|tsv|xlsx?)$`)
+	docFileRe = regexp.MustCompile(`^[\w@%+=~./-]*[\w@%+=-]\.(?i:html?|md|markdown|pdf|png|jpe?g|gif|webp|svg|csv|tsv|xlsx?|docx?)$`)
 )
 
 // mentionedFiles finds the documents a message names (absolute, ~/ or relative to the session's cwd)

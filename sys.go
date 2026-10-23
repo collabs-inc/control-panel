@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -110,6 +111,38 @@ func parseMeminfo(b []byte) map[string]uint64 {
 	return m
 }
 
+// memParts splits RAM the way the Memory card does: apps (anonymous pages), page cache (less
+// tmpfs/shm, which shows apart) and the kernel's slab.
+func memParts(m map[string]uint64) (apps, cache, kern uint64) {
+	cache = m["Cached"] + m["Buffers"]
+	return m["AnonPages"], cache - min(cache, m["Shmem"]), m["Slab"]
+}
+
+// PSI is /proc/pressure/memory: the % of time some (or all, "full") tasks stalled waiting for memory.
+type PSI struct {
+	Some10  float64 `json:"some10"`
+	Some60  float64 `json:"some60"`
+	Some300 float64 `json:"some300"`
+	Full10  float64 `json:"full10"`
+}
+
+func parsePSI(b []byte) (p PSI) {
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 4 {
+			continue
+		}
+		v := func(i int) float64 { _, s, _ := strings.Cut(f[i], "="); x, _ := strconv.ParseFloat(s, 64); return x }
+		switch f[0] {
+		case "some":
+			p.Some10, p.Some60, p.Some300 = v(1), v(2), v(3)
+		case "full":
+			p.Full10 = v(1)
+		}
+	}
+	return
+}
+
 func parseNetDev(b []byte) (rx, tx uint64) {
 	for _, line := range strings.Split(string(b), "\n") {
 		name, rest, ok := strings.Cut(line, ":")
@@ -173,13 +206,14 @@ var runnerDirRe = regexp.MustCompile(`/ci-cd-jobs/((?:r|fe)\d+)/`)
 // groupKey decides which app a process belongs to, first match wins:
 //  1. a CI runner (by path, or RUNNER_NAME env in job steps);
 //  2. a zellij pane's root shell (parent is the zellij server);
-//  3. a root process (ppid ≤ 2: init, kthreadd, or daemonized) → its own name,
-//     even if it inherited a pane's env (e.g. the Docker VM started from a shell);
+//  3. a root process (ppid ≤ 2: init, kthreadd, or daemonized) → CI's when it runs in a runner's folder (a job's
+//     redis-server, which wipes its env), else its own name, even if it inherited a pane's env (e.g. the Docker VM
+//     started from a shell);
 //  4. otherwise its parent's group.
 //
 // zsession, when set, is the pane's current session name (see zellijSessions); env
 // ZELLIJ_SESSION_NAME keeps the name the session had when the pane was opened.
-func groupKey(cmdline, environ []byte, comm, parentComm string, ppid int, parentKey, parentLabel, zsession string) (key, label string) {
+func groupKey(cmdline, environ []byte, comm, parentComm string, ppid int, parentKey, parentLabel, zsession, cwd string) (key, label string) {
 	if m := runnerDirRe.FindSubmatch(cmdline); m != nil {
 		return "runner:" + string(m[1]), "CI runner " + string(m[1])
 	}
@@ -203,6 +237,9 @@ func groupKey(cmdline, environ []byte, comm, parentComm string, ppid int, parent
 		return "pane:" + zs + ":" + zp, zs + " · pane " + zp
 	}
 	if ppid <= 2 || parentKey == "" {
+		if m := runnerDirRe.FindStringSubmatch(cwd + "/"); m != nil {
+			return "runner:" + m[1], "CI runner " + m[1]
+		}
 		l := rootLabel(comm, cmdline)
 		return l, l
 	}
@@ -315,6 +352,7 @@ type ProcGroup struct {
 	Conns int     `json:"conns"`
 	N     int     `json:"n"`
 	Procs []Proc  `json:"procs"`
+	RSS1h *int64  `json:"rss1h,omitempty"` // RSS change over the last hour; nil until the panel has watched that long
 }
 
 type Resources struct {
@@ -326,6 +364,14 @@ type Resources struct {
 	MemAvail  uint64              `json:"memAvail"`
 	SwapTotal uint64              `json:"swapTotal"`
 	SwapFree  uint64              `json:"swapFree"`
+	MemFree   uint64              `json:"memFree"`
+	Anon      uint64              `json:"anon"`
+	Cache     uint64              `json:"cache"` // Cached + Buffers − Shmem
+	Slab      uint64              `json:"slab"`
+	SReclaim  uint64              `json:"sreclaim"`
+	Shmem     uint64              `json:"shmem"`
+	Dirty     uint64              `json:"dirty"`
+	PSI       PSI                 `json:"psi"`
 	Disks     []Disk              `json:"disks"`
 	NetRx     float64             `json:"netRx"`
 	NetTx     float64             `json:"netTx"`
@@ -349,6 +395,7 @@ type paneInfo struct {
 	FgSince int64  // unix start of the foreground leader
 	Output  int64  // unix mtime of the pane's tty: the kernel bumps it on writes (8 s granularity)
 	Cwd     string // working directory of the foreground process (the shell's, at a prompt)
+	Ports   []int  // TCP ports something in the pane listens on
 	CPU     float64
 	RSS     uint64
 	N       int
@@ -375,6 +422,26 @@ type sysSampler struct {
 	prevRx  uint64
 	prevTx  uint64
 	procs   map[int]*procInfo
+	snaps   []rssSnap
+}
+
+// rssSnap is every group's RSS at one moment: one is kept every 10 min, the last 7.
+type rssSnap struct {
+	t   time.Time
+	rss map[string]uint64
+}
+
+// rssBase keeps cur every 10 min and returns what to measure an hour's change against: the
+// oldest snapshot once it's ≥ 50 min old, nil before that.
+func (s *sysSampler) rssBase(now time.Time, cur map[string]uint64) map[string]uint64 {
+	if n := len(s.snaps); n == 0 || now.Sub(s.snaps[n-1].t) >= 10*time.Minute {
+		s.snaps = append(s.snaps, rssSnap{now, cur})
+		s.snaps = s.snaps[max(0, len(s.snaps)-7):]
+	}
+	if now.Sub(s.snaps[0].t) >= 50*time.Minute {
+		return s.snaps[0].rss
+	}
+	return nil
 }
 
 func newSysSampler(procRoot string) *sysSampler {
@@ -436,38 +503,76 @@ func (s *sysSampler) liveSessions() []string {
 	return append([]string(nil), s.live...)
 }
 
-// zellijSessions maps zellij server pids to their current session names. A rename keeps
-// the original name in the server's cmdline and in older panes' env, but moves the socket
-// file — whose mtime is the moment the server created it at startup.
-func zellijSessions(stats map[int]procStat, btime int64, dir string) map[int]string {
+// zellijSessions maps zellij server pids to their current session names. A server's cmdline names
+// the socket it made (--server <dir>/<name>), but a rename moves the socket file and leaves the old
+// name there, so the socket's mtime (the moment the server created it at startup) matches the rest.
+// Pairs go best first, each socket and server once: timing alone can't tell apart servers started in
+// the same second (sessions resurrected back to back), and a random pick there hid one of them.
+func zellijSessions(stats map[int]procStat, btime int64, dir string, cmdline func(pid int) []byte) map[int]string {
 	out := map[int]string{}
 	if dir == "" {
 		return out
 	}
+	cmds := map[int]string{} // server pid → its cmdline
+	for pid, st := range stats {
+		if st.Comm == "zellij" && st.PPID <= 1 {
+			cmds[pid] = strings.TrimRight(string(cmdline(pid)), "\x00")
+		}
+	}
+	type pair struct {
+		pid   int
+		name  string
+		other bool  // the server's cmdline names another socket (renamed since)
+		d     int64 // |socket mtime − server start|, seconds
+	}
+	var pairs []pair
 	ents, _ := os.ReadDir(dir)
 	for _, e := range ents {
 		fi, err := e.Info()
 		if err != nil || fi.IsDir() {
 			continue
 		}
-		best, bestD := 0, int64(4) // ponytail: ±3 s match window; widen if a slow box ever misses
-		for pid, st := range stats {
-			if st.Comm != "zellij" || st.PPID > 1 {
-				continue
-			}
-			d := fi.ModTime().Unix() - (btime + int64(st.Start/clkTck))
+		for pid, cmd := range cmds {
+			d := fi.ModTime().Unix() - (btime + int64(stats[pid].Start/clkTck))
 			if d < 0 {
 				d = -d
 			}
-			if d < bestD {
-				best, bestD = pid, d
+			if d < 4 { // ponytail: ±3 s match window; widen if a slow box ever misses
+				pairs = append(pairs, pair{pid, e.Name(), !strings.HasSuffix(cmd, "/"+e.Name()), d})
 			}
 		}
-		if best != 0 {
-			out[best] = e.Name()
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		a, b := pairs[i], pairs[j]
+		if a.other != b.other {
+			return !a.other
+		}
+		if a.d != b.d {
+			return a.d < b.d
+		}
+		if a.pid != b.pid {
+			return a.pid < b.pid
+		}
+		return a.name < b.name
+	})
+	taken := map[string]bool{}
+	for _, p := range pairs {
+		if _, ok := out[p.pid]; !ok && !taken[p.name] {
+			out[p.pid], taken[p.name] = p.name, true
 		}
 	}
 	return out
+}
+
+// runsScript: a shell started on a script or a -c command, not an interactive one (zsh, -zsh, zsh -l).
+func runsScript(cmd string) bool {
+	f := strings.Fields(cmd)
+	for i := 1; i < len(f); i++ {
+		if f[i] == "-c" || !strings.HasPrefix(f[i], "-") {
+			return true
+		}
+	}
+	return false
 }
 
 func parseBtime(stat []byte) int64 {
@@ -504,6 +609,9 @@ func (s *sysSampler) sample(now time.Time, sock sockScan) Resources {
 
 	m := parseMeminfo(s.read("meminfo"))
 	r.MemTotal, r.MemAvail, r.SwapTotal, r.SwapFree = m["MemTotal"], m["MemAvailable"], m["SwapTotal"], m["SwapFree"]
+	r.Anon, r.Cache, r.Slab = memParts(m)
+	r.MemFree, r.SReclaim, r.Shmem, r.Dirty = m["MemFree"], m["SReclaimable"], m["Shmem"], m["Dirty"]
+	r.PSI = parsePSI(s.read("pressure/memory")) // missing on old kernels: all zeros
 	if f := strings.Fields(string(s.read("loadavg"))); len(f) >= 3 {
 		for i := range 3 {
 			r.Load[i], _ = strconv.ParseFloat(f[i], 64)
@@ -533,7 +641,7 @@ func (s *sysSampler) sample(now time.Time, sock sockScan) Resources {
 		sockDir = defaultSockDir()
 	}
 	btime := parseBtime(statB)
-	zs := zellijSessions(stats, btime, sockDir)
+	zs := zellijSessions(stats, btime, sockDir, func(pid int) []byte { return s.read(strconv.Itoa(pid) + "/cmdline") })
 	live := make([]string, 0, len(zs))
 	for _, name := range zs {
 		live = append(live, name)
@@ -561,7 +669,8 @@ func (s *sysSampler) sample(now time.Time, sock sockScan) Resources {
 			}
 		}
 		cmdline := s.read(base + "cmdline")
-		key, label := groupKey(cmdline, s.read(base+"environ"), st.Comm, pcomm, st.PPID, pk, pl, zs[st.PPID])
+		cwd, _ := os.Readlink(s.root + "/" + base + "cwd")
+		key, label := groupKey(cmdline, s.read(base+"environ"), st.Comm, pcomm, st.PPID, pk, pl, zs[st.PPID], cwd)
 		cmd := strings.TrimSpace(string(bytes.ReplaceAll(cmdline, []byte{0}, []byte{' '})))
 		if cmd == "" {
 			cmd = "[" + st.Comm + "]"
@@ -631,10 +740,20 @@ func (s *sysSampler) sample(now time.Time, sock sockScan) Resources {
 				}
 			}
 		}
-		if fg, ok := stats[st.TPGID]; ok && st.TPGID > 0 {
-			info.FgPID, info.FgComm, info.FgState = st.TPGID, fg.Comm, fg.State
+		fgPID := st.TPGID
+		if fgPID == pid && shellComms[st.Comm] && runsScript(pi.cmd) {
+			// a script (bash ./run-x.sh) has no job control: what it runs stays in its process group, so the
+			// terminal's foreground is the script itself; its newest child in that group is what it waits on
+			for q, qst := range stats {
+				if qst.PGRP == pid && qst.PPID == pid && (fgPID == pid || qst.Start > stats[fgPID].Start || qst.Start == stats[fgPID].Start && q > fgPID) {
+					fgPID = q
+				}
+			}
+		}
+		if fg, ok := stats[fgPID]; ok && fgPID > 0 {
+			info.FgPID, info.FgComm, info.FgState = fgPID, fg.Comm, fg.State
 			info.FgSince = btime + int64(fg.Start/clkTck)
-			if fp := s.procs[st.TPGID]; fp != nil {
+			if fp := s.procs[fgPID]; fp != nil {
 				info.FgCmd = fp.cmd
 			}
 		}
@@ -648,7 +767,31 @@ func (s *sysSampler) sample(now time.Time, sock sockScan) Resources {
 		info.Cwd, _ = os.Readlink(s.root + "/" + strconv.Itoa(cwdOf) + "/cwd")
 		r.panes[pi.key] = info
 	}
+	// what each pane's processes listen on, from the socket scan the security view already makes (every 10 s)
+	for _, e := range sock.entries {
+		if e.Proto[:3] != "tcp" || e.State != "0A" {
+			continue
+		}
+		pi := s.procs[sock.inodePID[e.Inode]]
+		if pi == nil {
+			continue
+		}
+		if info, ok := r.panes[pi.key]; ok && !slices.Contains(info.Ports, int(e.Local.Port())) {
+			info.Ports = append(info.Ports, int(e.Local.Port()))
+			slices.Sort(info.Ports)
+			r.panes[pi.key] = info
+		}
+	}
+	cur := make(map[string]uint64, len(groups))
+	for k, g := range groups {
+		cur[k] = g.RSS
+	}
+	base := s.rssBase(now, cur)
 	for _, g := range groups {
+		if base != nil {
+			d := int64(g.RSS) - int64(base[g.Key]) // a group born since counts from zero
+			g.RSS1h = &d
+		}
 		sort.Slice(g.Procs, func(i, j int) bool {
 			a, b := g.Procs[i], g.Procs[j]
 			return a.CPU > b.CPU || (a.CPU == b.CPU && a.RSS > b.RSS)
@@ -660,9 +803,20 @@ func (s *sysSampler) sample(now time.Time, sock sockScan) Resources {
 		a, b := r.Groups[i], r.Groups[j]
 		return a.CPU > b.CPU || (a.CPU == b.CPU && a.RSS > b.RSS)
 	})
-	// ponytail: top 40 by CPU; a group idle on CPU but huge on RAM can drop off — sort RAM server-side if that bites.
+	// the top 40 by CPU, plus any of the top 8 by RAM that idle below them (Who's using memory)
 	r.all = r.Groups
-	r.Groups = r.Groups[:min(len(r.Groups), maxGroups)]
+	byRSS := slices.Clone(r.all)
+	sort.SliceStable(byRSS, func(i, j int) bool { return byRSS[i].RSS > byRSS[j].RSS }) // ties keep CPU order
+	top := map[string]bool{}
+	for _, g := range byRSS[:min(len(byRSS), 8)] {
+		top[g.Key] = true
+	}
+	r.Groups = nil
+	for i, g := range r.all {
+		if i < maxGroups || top[g.Key] {
+			r.Groups = append(r.Groups, g)
+		}
+	}
 	s.prevT = now
 	return r
 }
@@ -690,14 +844,18 @@ func disks(mounts []byte) []Disk {
 	return out
 }
 
-// ---- 1 h history of cheap totals (runs even with no clients: 3 small reads / 10 s) ----
+// ---- 1 h history of cheap totals (runs even with no clients: 4 small reads / 10 s) ----
 
 type histPoint struct {
-	T   int64   `json:"t"`
-	CPU float64 `json:"cpu"`
-	Mem float64 `json:"mem"`
-	Rx  float64 `json:"rx"`
-	Tx  float64 `json:"tx"`
+	T     int64   `json:"t"`
+	CPU   float64 `json:"cpu"`
+	Mem   float64 `json:"mem"`
+	Rx    float64 `json:"rx"`
+	Tx    float64 `json:"tx"`
+	Apps  uint64  `json:"apps"` // memParts, bytes
+	Cache uint64  `json:"cache"`
+	Kern  uint64  `json:"kern"`
+	PSI   float64 `json:"psi"` // memory pressure, some avg10
 }
 
 type history struct {
@@ -719,6 +877,7 @@ func (h *history) tick(now time.Time) {
 	st, _ := os.ReadFile(h.root + "/stat")
 	mi, _ := os.ReadFile(h.root + "/meminfo")
 	nd, _ := os.ReadFile(h.root + "/net/dev")
+	ps, _ := os.ReadFile(h.root + "/pressure/memory")
 	cpu := parseCPU(st)
 	m := parseMeminfo(mi)
 	rx, tx := parseNetDev(nd)
@@ -726,7 +885,8 @@ func (h *history) tick(now time.Time) {
 	defer h.mu.Unlock()
 	if !h.prevT.IsZero() && len(cpu) > 0 {
 		dt := now.Sub(h.prevT).Seconds()
-		p := histPoint{T: now.Unix(), CPU: cpuPct(h.prevCPU, cpu[0])}
+		p := histPoint{T: now.Unix(), CPU: cpuPct(h.prevCPU, cpu[0]), PSI: parsePSI(ps).Some10}
+		p.Apps, p.Cache, p.Kern = memParts(m)
 		if m["MemTotal"] > 0 {
 			p.Mem = float64(m["MemTotal"]-m["MemAvailable"]) / float64(m["MemTotal"]) * 100
 		}

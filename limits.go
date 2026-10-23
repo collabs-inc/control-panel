@@ -21,6 +21,10 @@ import (
 // one-way: RLIMIT_NICE is 0), idle disk priority (reversible), and pause/resume (SIGSTOP/SIGCONT).
 // Rules are keyed by process-group key and re-applied every 10 s, so new processes in the group
 // get them too. Affinity, nice and ioprio are per thread on Linux: every thread gets them.
+//
+// The CI reserve is a rule on "*": every group without cores of its own, CI runners aside, runs on its cores while
+// a CI job runs, so the cores it leaves out are CI's; once CI is idle everything gets them back.
+const restKey = "*"
 
 type Limit struct {
 	Key    string `json:"key"`
@@ -39,6 +43,7 @@ type procOps struct {
 	ioprio   func(tid int, idle bool) error
 	signal   func(pid int, s syscall.Signal) error
 	guard    func(pid int) (touch, pause bool)
+	comm     func(pid int) string
 }
 
 type limiter struct {
@@ -49,12 +54,13 @@ type limiter struct {
 	rules map[string]Limit
 	undo  map[string]Limit // aspects dropped by edits/removal, reverted on the next apply (only the enforcer makes syscalls)
 	kick  chan struct{}
+	held  bool // the CI reserve is on the processes it covers (only the enforcer touches it)
 	smu   sync.Mutex
 	sys   *sysSampler
 }
 
 func newLimiter(path string, ncpu int, ops procOps) *limiter {
-	l := &limiter{path: path, ncpu: ncpu, ops: ops, rules: map[string]Limit{}, undo: map[string]Limit{}, kick: make(chan struct{}, 1)}
+	l := &limiter{path: path, ncpu: ncpu, ops: ops, rules: map[string]Limit{}, undo: map[string]Limit{}, kick: make(chan struct{}, 1), held: true}
 	if b, err := os.ReadFile(path); err == nil {
 		var rs []Limit
 		if json.Unmarshal(b, &rs) == nil {
@@ -100,6 +106,9 @@ func (l *limiter) valid(r *Limit) error {
 	if r.Nice != 0 && r.Nice != 10 && r.Nice != 19 {
 		return errors.New("priority must be normal (0), low (10) or lowest (19)")
 	}
+	if r.Key == restKey && (r.Nice != 0 || r.IOIdle || r.Paused) {
+		return errors.New("the CI reserve only takes cores")
+	}
 	if len(r.Cores) == 0 && r.Nice == 0 && !r.IOIdle && !r.Paused {
 		return errors.New("that limits nothing: remove the limit instead")
 	}
@@ -110,11 +119,7 @@ func (l *limiter) save() error {
 	rs := l.listLocked()
 	b, _ := json.MarshalIndent(rs, "", "  ")
 	os.MkdirAll(filepath.Dir(l.path), 0o700)
-	tmp := l.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, l.path)
+	return writeFileAtomic(l.path, b, 0o600)
 }
 
 // set adds or replaces a group's rule; what the edit dropped is reverted on the next apply.
@@ -219,10 +224,21 @@ func (l *limiter) apply(pids map[string][]int) {
 	rules, undo := l.listLocked(), l.undo
 	l.undo = map[string]Limit{}
 	l.mu.Unlock()
+	busy := l.reserve(rules, undo, pids)
 	for _, u := range undo {
 		l.revert(u, pids[u.Key])
 	}
 	for _, r := range rules {
+		if r.Key == restKey {
+			if !busy { // CI is idle: the kept cores are everyone's again
+				if l.held {
+					l.revert(r, pids[restKey])
+					l.held = false
+				}
+				continue
+			}
+			l.held = true
+		}
 		for _, pid := range pids[r.Key] {
 			touch, pause := l.ops.guard(pid)
 			if !touch {
@@ -244,6 +260,43 @@ func (l *limiter) apply(pids map[string][]int) {
 			}
 		}
 	}
+}
+
+// reserve puts the pids the CI reserve covers under "*" and says whether a CI job is running. While one is, the
+// runners get every core, in case one inherited fewer from the shell that started it.
+func (l *limiter) reserve(rules []Limit, undo map[string]Limit, pids map[string][]int) (busy bool) {
+	own, on := map[string]bool{}, false
+	for _, r := range rules {
+		own[r.Key] = len(r.Cores) > 0
+		on = on || r.Key == restKey
+	}
+	if _, off := undo[restKey]; !on && !off {
+		return false
+	}
+	var rest, runners []int
+	for k, ps := range pids {
+		switch {
+		case strings.HasPrefix(k, "runner:"):
+			for _, pid := range ps {
+				busy = busy || l.ops.comm(pid) == "Runner.Worker"
+			}
+			if !own[k] {
+				runners = append(runners, ps...)
+			}
+		case !own[k] && k != restKey:
+			rest = append(rest, ps...)
+		}
+	}
+	pids[restKey] = rest
+	for _, pid := range runners {
+		if touch, _ := l.ops.guard(pid); !on || !busy || !touch {
+			continue
+		}
+		for _, tid := range l.ops.tids(pid) {
+			l.ops.affinity(tid, l.allCores())
+		}
+	}
+	return busy
 }
 
 // pidsNow samples /proc with the limiter's own sampler (the page sampler only runs while pages are open).
@@ -324,6 +377,7 @@ func realProcOps() procOps {
 			}
 			return true, killGuard(pid, st, uid, procCmdline(pid)) == nil
 		},
+		comm: func(pid int) string { st, _ := procStartOf(pid); return st.Comm },
 	}
 }
 

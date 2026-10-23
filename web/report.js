@@ -3,7 +3,7 @@
 // page, so a failure only one device has can be fixed from the VM.
 (function () {
   var sent = 0;
-  function report(kind, msg, stack) {
+  function report(kind, msg, stack, quiet) { // quiet: logged, no banner (the page is already recovering)
     if (++sent > 20) return;
     try {
       fetch('/api/client-error', {
@@ -11,6 +11,7 @@
         body: JSON.stringify({ kind: kind, msg: String(msg).slice(0, 500), stack: String(stack || '').slice(0, 3000), view: document.title }),
       }).catch(function () {});
     } catch (e) { /* nothing more to do */ }
+    if (quiet) return;
     var el = document.getElementById('cerr');
     if (!el && document.body) {
       el = document.createElement('button');
@@ -29,6 +30,12 @@
   });
   addEventListener('unhandledrejection', function (e) {
     var r = e.reason || {};
-    report('rejection', r.message || r, r.stack);
+    // a request the network dropped (Chrome "Failed to fetch", Safari "Load failed", Firefox "NetworkError…"),
+    // say right after the laptop wakes, is not a bug in the page: logged quietly, no banner
+    var net = r.name === 'TypeError' && /Failed to fetch|Load failed|NetworkError|network connection was lost/i.test(r.message || '');
+    report(net ? 'network' : 'rejection', r.message || r, r.stack, net);
   });
+  // the session check, sent before the other scripts run, so it travels meanwhile; app.js's boot reads it
+  window.cpMe = fetch('/api/me', { credentials: 'same-origin' });
+  window.cpMe.catch(function () {}); // a failure is the boot's to handle, not an error to report
 })();

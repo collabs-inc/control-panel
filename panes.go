@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -130,7 +131,7 @@ func (s *server) screenStream(w http.ResponseWriter, r *http.Request, session st
 			}
 		}
 	}()
-	tok, email := s.sessionToken(r), identity(r)
+	tok, email := sessionToken(r), identity(r)
 	ping := time.NewTicker(pingEvery)
 	defer ping.Stop()
 	var last time.Time
@@ -165,25 +166,48 @@ func (s *server) screenStream(w http.ResponseWriter, r *http.Request, session st
 	}
 }
 
-// A chat opens on its last 5000 items (up to 16 MB of transcript); scrolling up pages back 4 MB at a time.
+// A chat opens on its last chatFirst items, and scrolling up brings chatFirst more at a time: a long
+// session's chat opens at once even on a phone (a 45 MB transcript used to send 4000 items, 2.5 MB, first).
 const (
-	chatWindow = 16 << 20
-	chatItems  = 5000
-	chatPage   = 4 << 20
+	chatWindow = 16 << 20 // how far back the first window may look
+	chatFirst  = 300
+	chatPage   = 4 << 20 // how far back each earlier page may look
+	peekWindow = 2 << 20 // the peek's latest turn: a small read, it asks every few seconds while Claude works
+	peekItems  = 120
 )
+
+// firstChat: a chat's last items, where "Load earlier" goes on from (before), and where its live tail starts (end).
+func firstChat(path string) (items []ChatItem, before, end int64, title string) {
+	ls, start, stop := readTail(path, chatWindow)
+	items, before, title = tailChat(ls, start, chatFirst, 0)
+	return items, before, stop, title
+}
+
+// earlierChat: the chatFirst items just before `before`, and where the next page back begins.
+func earlierChat(path string, before int64) ([]ChatItem, int64) {
+	ls, start := readBefore(path, before, chatPage)
+	items, b, _ := tailChat(ls, start, chatFirst, 0)
+	return items, b
+}
 
 func lastItems(items []ChatItem, n int) []ChatItem { return items[max(0, len(items)-n):] }
 
 // chatStream sends the transcript's tail, then whatever gets appended (polled every second).
-// A new sessionId in the same pane (/clear, /resume) resets the chat.
+// A new sessionId in the same pane (/clear, /resume) resets the chat. A Claude that hasn't had a message
+// yet has no transcript (Claude Code writes it with the first): the chat starts empty, so your first
+// message can go from there, and switches to the transcript once it appears.
 func (s *server) chatStream(w http.ResponseWriter, r *http.Request, session string, pane int) {
 	p, ok := s.term.pane(session, pane)
-	if !ok || p.Agent == nil || p.Agent.path == "" {
+	if !ok || p.Agent == nil {
 		writeJSON(w, 404, map[string]any{"error": "no chat for this pane"})
 		return
 	}
 	path, sid := p.Agent.path, p.Agent.sid
 	q := r.URL.Query()
+	if path == "" && (q.Get("sub") != "" || q.Get("tool") != "") {
+		writeJSON(w, 404, map[string]any{"error": "no chat for this pane"})
+		return
+	}
 	var sub *Subagent // a subagent's own chat: its transcript instead of the pane's
 	if q.Get("sub") != "" || q.Get("tool") != "" {
 		sp, m, err := subagentPath(path, q.Get("sub"), q.Get("tool"))
@@ -198,11 +222,24 @@ func (s *server) chatStream(w http.ResponseWriter, r *http.Request, session stri
 		return
 	}
 	defer e.close()
+	if path != "" && sub == nil { // the Files panel's list, read ahead: its first scan of a long session takes seconds
+		root := ""
+		if p.Git != nil {
+			root = p.Git.Root
+		}
+		go s.arts.list(path, root)
+	}
 	var end int64
 	var lastPR string // the PR note last sent: a later batch doesn't repeat it
+	var open bool     // a turn under way at the end of what was sent: the next batch's hidden entries ride along in it
 	reset := func() {
-		ls, start, stop := readTail(path, chatWindow)
-		items, before, title := tailChat(ls, start, chatItems, 0)
+		if path == "" { // no transcript yet: an empty chat, for now
+			e.send(map[string]any{"t": "chat", "reset": true, "items": []ChatItem{}, "before": 0, "title": ""})
+			end = 0
+			return
+		}
+		items, before, stop, title := firstChat(path)
+		open = turnOpen(items, false)
 		lastPR = ""
 		items = newPRs(items, &lastPR)
 		m := map[string]any{"t": "chat", "reset": true, "items": items, "before": before, "title": title}
@@ -213,7 +250,7 @@ func (s *server) chatStream(w http.ResponseWriter, r *http.Request, session stri
 		end = stop
 	}
 	reset()
-	tok, email := s.sessionToken(r), identity(r)
+	tok, email := sessionToken(r), identity(r)
 	tick, ping := time.NewTicker(time.Second), time.NewTicker(pingEvery)
 	defer tick.Stop()
 	defer ping.Stop()
@@ -227,9 +264,12 @@ func (s *server) chatStream(w http.ResponseWriter, r *http.Request, session stri
 			}
 			e.ping()
 		case <-tick.C:
-			if q, ok := s.term.pane(session, pane); ok && sub == nil && q.Agent != nil && q.Agent.path != "" && q.Agent.sid != sid {
-				path, sid = q.Agent.path, q.Agent.sid
+			if q, ok := s.term.pane(session, pane); ok && sub == nil && q.Agent != nil && q.Agent.path != "" && (q.Agent.sid != sid || path == "") {
+				path, sid = q.Agent.path, q.Agent.sid // a new session in the pane, or the first message wrote the transcript
 				reset()
+				continue
+			}
+			if path == "" {
 				continue
 			}
 			fi, err := os.Stat(path)
@@ -245,7 +285,8 @@ func (s *server) chatStream(w http.ResponseWriter, r *http.Request, session stri
 				continue
 			}
 			end = next
-			items, title := parseChat(ls)
+			items, title := parseChatOpen(ls, open) // this batch may begin inside a turn
+			open = turnOpen(items, open)
 			if items = newPRs(items, &lastPR); len(items) > 0 || title != "" {
 				e.send(map[string]any{"t": "chat", "items": lastItems(items, 300), "title": title})
 			}
@@ -253,7 +294,7 @@ func (s *server) chatStream(w http.ResponseWriter, r *http.Request, session stri
 	}
 }
 
-// paneChat pages back through the transcript: items in the chatPage bytes before `before`.
+// paneChat pages back through the transcript: the chatFirst items before `before` (earlierChat).
 func (s *server) paneChat(w http.ResponseWriter, r *http.Request) {
 	session, pane, err := paneParams(r)
 	if err != nil {
@@ -266,6 +307,17 @@ func (s *server) paneChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	before, _ := strconv.ParseInt(r.URL.Query().Get("before"), 10, 64)
+	if tail := r.URL.Query().Get("tail"); before <= 0 && tail != "" { // the chat's latest items, for the Terminals page's peek:
+		var items []ChatItem // "live" (asked every few seconds while Claude works) reads a little, else as the chat opens
+		if tail == "live" {
+			ls, start, _ := readTail(p.Agent.path, peekWindow)
+			items, before, _ = tailChat(ls, start, peekItems, 0)
+		} else {
+			items, before, _, _ = firstChat(p.Agent.path)
+		}
+		writeJSON(w, 200, map[string]any{"items": items, "before": before})
+		return
+	}
 	if before <= 0 {
 		writeJSON(w, 200, map[string]any{"items": []ChatItem{}, "before": 0})
 		return
@@ -277,12 +329,15 @@ func (s *server) paneChat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	ls, start := readBefore(path, before, chatPage)
-	items, _ := parseChat(ls)
+	items, start := earlierChat(path, before)
 	writeJSON(w, 200, map[string]any{"items": items, "before": start})
 }
 
 // ---- typing into a pane ----
+
+// maxPaste: a message goes to zellij as one argument, and Linux caps one argument at 128 KiB. The page
+// sends anything longer as an attached file instead.
+const maxPaste = 100 << 10
 
 func (s *server) paneInput(w http.ResponseWriter, r *http.Request) {
 	var b struct {
@@ -291,10 +346,12 @@ func (s *server) paneInput(w http.ResponseWriter, r *http.Request) {
 		Text    string
 		Enter   bool
 		Keys    []string
-		Choose  string // answer the prompt on screen by option label…
-		Sig     string // …of exactly this question (Prompt.Sig as the page saw it)
+		Choose  string  // answer the prompt on screen by option label (or with Answer)…
+		Answer  *Answer // …a free-text answer, or a multi-select's ticks…
+		Sig     string  // …to exactly this question (Prompt.Sig as the page saw it)
+		Clear   bool    // a message: empty Claude Code's input box first (what it held goes)
 	}
-	if err := readJSONN(r, &b, 96<<10); err != nil {
+	if err := readJSONN(r, &b, 1<<20); err != nil { // JSON escapes can grow the text several times over
 		writeJSON(w, 400, map[string]any{"error": "bad request"})
 		return
 	}
@@ -303,19 +360,34 @@ func (s *server) paneInput(w http.ResponseWriter, r *http.Request) {
 	case !sessionNameRe.MatchString(b.Session) || len(b.Session) > 64 || b.Pane < 0:
 		bad("bad session or pane")
 		return
-	case len(b.Text) > 16<<10 || !utf8.ValidString(b.Text):
-		bad("text too long or not UTF-8")
+	case len(b.Text) > maxPaste:
+		bad("messages paste up to 100 KB: attach a longer text as a file")
+		return
+	case !utf8.ValidString(b.Text):
+		bad("text isn't UTF-8")
 		return
 	case len(b.Keys) > 10:
 		bad("too many keys")
 		return
-	case len(b.Choose) > 200:
-		bad("choice too long")
-		return
-	case b.Choose != "" && b.Sig == "":
-		bad("say which question you're answering")
-		return
-	case b.Text == "" && !b.Enter && len(b.Keys) == 0 && b.Choose == "":
+	case b.Choose != "" && b.Answer == nil:
+		b.Answer = &Answer{Choose: b.Choose}
+	}
+	if a := b.Answer; a != nil {
+		long := len(a.Choose) > 200 || len(a.Text) > 2000 || !utf8.ValidString(a.Text) || len(a.Checks) > 20
+		for _, c := range a.Checks {
+			long = long || len(c) > 200
+		}
+		switch {
+		case long:
+			bad("answer too long")
+			return
+		case b.Sig == "":
+			bad("say which question you're answering")
+			return
+		}
+	}
+	switch {
+	case b.Text == "" && !b.Enter && len(b.Keys) == 0 && b.Answer == nil:
 		bad("nothing to send")
 		return
 	}
@@ -335,22 +407,28 @@ func (s *server) paneInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	what := fmt.Sprintf("%s:%d", b.Session, b.Pane)
-	if b.Choose != "" { // read the screen now: the highlight may have moved since the page last looked
-		screen, err := s.z.dump(b.Session, b.Pane)
-		var p *Prompt
-		if err == nil {
-			p = parsePrompt(screen)
+	if b.Answer != nil {
+		s.answer(w, r, b.Session, b.Pane, b.Sig, *b.Answer, what)
+		return
+	}
+	tp, _ := s.term.pane(b.Session, b.Pane)
+	claude := tp.Agent != nil || tp.Kind == "claude"
+	if b.Text != "" && b.Enter { // a message is never pasted on top of what Claude Code's box still holds (sent as one)
+		if tp.Agent != nil && tp.Agent.path != "" { // a shell has no box to check
+			screen, _ := s.z.dump(b.Session, b.Pane)
+			if box := claudeBox(screen); box != "" && restored(box, recentSent(tp.Agent.path)) { // a suggestion isn't held against you
+				if !b.Clear {
+					writeJSON(w, 409, map[string]any{"error": "Claude's input box already has text in it", "box": box})
+					return
+				}
+				if err := s.clearBox(b.Session, b.Pane, strings.Count(box, "\n")+1, []string{box}); err != nil {
+					s.audit.add("input-fail", what+": "+err.Error(), clientIP(r))
+					writeJSON(w, 502, map[string]any{"error": err.Error()})
+					return
+				}
+				what += " (cleared " + strconv.Quote(trunc(box, 40)) + " from its box first)"
+			}
 		}
-		keys, ok := []string(nil), false
-		if p != nil && p.Sig == b.Sig {
-			keys, ok = p.keysFor(b.Choose)
-		}
-		if !ok {
-			writeJSON(w, 409, map[string]any{"error": "that question is no longer on screen"})
-			return
-		}
-		what += " choose " + strconv.Quote(trunc(b.Choose, 80))
-		b.Keys = append(keys, b.Keys...)
 	}
 	if len(b.Keys) > 0 {
 		what += " keys " + strings.Join(b.Keys, ",")
@@ -358,7 +436,14 @@ func (s *server) paneInput(w http.ResponseWriter, r *http.Request) {
 	}
 	if err == nil && b.Text != "" {
 		what += " " + strconv.Quote(trunc(b.Text, 80))
-		err = s.z.paste(b.Session, b.Pane, b.Text)
+		if b.Enter && claude {
+			var note string
+			note, err = s.sendToClaude(b.Session, b.Pane, b.Text)
+			what += " ⏎" + note
+			b.Enter = false
+		} else {
+			err = s.z.paste(b.Session, b.Pane, b.Text)
+		}
 	}
 	if err == nil && b.Enter {
 		what += " ⏎"
@@ -366,11 +451,162 @@ func (s *server) paneInput(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		s.audit.add("input-fail", what+": "+err.Error(), clientIP(r))
-		writeJSON(w, 502, map[string]any{"error": err.Error()})
+		code := 502
+		if errors.Is(err, errNotTaken) {
+			code = 409 // not a retry: it's out of the box again, and the page says it wasn't sent
+		}
+		writeJSON(w, code, map[string]any{"error": err.Error()})
 		return
 	}
 	s.audit.add("input", what, clientIP(r))
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+var errNotTaken = errors.New("Claude Code didn't take it: it stayed in its input box")
+
+// sendToClaude types a message into Claude Code's input box and checks it went. Claude Code (2.1.296) reads a
+// pasted image path in the background and drops an Enter that comes meanwhile (its paste handler holds the
+// key, then clears it once the images land), and it attaches only a path pasted as a piece of its own (in
+// "a.png b.png text", b.png stays text). So the uploads go in first, alone, and the text once they show in the
+// box; then Enter, and a look at the box: still holding the message, Enter again; still there, it comes out.
+func (s *server) sendToClaude(session string, pane int, text string) (note string, err error) {
+	box := func() string { sc, _ := s.z.dump(session, pane); return claudeBox(sc) }
+	files, msg := leadUploads(text, s.uploadDir)
+	if len(files) > 0 {
+		n := strings.Count(nows(box()), "[Image#")
+		if err := s.z.paste(session, pane, strings.Join(files, " ")); err != nil {
+			return "", err
+		}
+		if !waitUntil(8*time.Second, func() bool {
+			b := nows(box())
+			return strings.Count(b, "[Image#") > n || strings.Contains(b, "/uploads/")
+		}) {
+			note = " (its photos didn't show in 8 s)" // a read that failed puts the path in as text
+		}
+		if msg != "" {
+			msg = " " + msg
+		}
+	}
+	if msg != "" {
+		if err := s.z.paste(session, pane, msg); err != nil {
+			return note, err
+		}
+	}
+	for try := range 2 {
+		if try > 0 {
+			note += " (Enter again: the first didn't take)"
+		}
+		if err := s.z.keys(session, pane, "Enter"); err != nil {
+			return note, err
+		}
+		if waitUntil(1500*time.Millisecond, func() bool { return !holds(box(), msg, len(files) > 0) }) {
+			return note, nil
+		}
+	}
+	b := box()
+	if err := s.clearBox(session, pane, strings.Count(b, "\n")+1, []string{b}); err != nil {
+		return note, err
+	}
+	return note, errNotTaken
+}
+
+// leadUploads: the uploads the page puts before a message ("<uploads>/x.png <uploads>/y.png text"), and the text.
+func leadUploads(text, dir string) (files []string, msg string) {
+	for {
+		f, rest, _ := strings.Cut(text, " ")
+		if filepath.Dir(f) != dir || !uploadNameRe.MatchString(filepath.Base(f)) {
+			return files, text
+		}
+		files, text = append(files, f), rest
+	}
+}
+
+// holds: whether Claude Code's box still has the message in it. The screen wraps it anywhere (a path mid-word),
+// so without spaces; a long one by its start or end (the box may show either), or Claude Code's mark for a paste.
+func holds(box, msg string, photos bool) bool {
+	b, m := nows(box), []rune(nows(msg))
+	switch {
+	case b == "":
+		return false
+	case strings.Contains(b, "[Pastedtext#"):
+		return true
+	case len(m) == 0:
+		return photos && strings.Contains(b, "[Image#")
+	case len(m) <= 48:
+		return strings.Contains(b, string(m))
+	}
+	return strings.Contains(b, string(m[:24])) || strings.Contains(b, string(m[len(m)-24:]))
+}
+
+func nows(s string) string { return strings.Join(strings.Fields(s), "") }
+
+// waitUntil checks ok every 100 ms for up to d.
+func waitUntil(d time.Duration, ok func() bool) bool {
+	for end := time.Now().Add(d); ; time.Sleep(100 * time.Millisecond) {
+		if ok() {
+			return true
+		}
+		if time.Now().After(end) {
+			return false
+		}
+	}
+}
+
+// answer replies to the question on a pane's screen. It reads the screen first (the highlight may have moved
+// since the page last looked), sends the steps with a moment between them (the dialog takes each before the
+// next: an arrow changes what typing goes into), then reads it again, so the page can show the next question
+// at once instead of after the tracker's next look.
+func (s *server) answer(w http.ResponseWriter, r *http.Request, session string, pane int, sig string, a Answer, what string) {
+	screen, err := s.z.dump(session, pane)
+	var p *Prompt
+	if err == nil {
+		p = parsePrompt(screen)
+	}
+	if p == nil || p.Sig != sig {
+		writeJSON(w, 409, map[string]any{"error": "that question is no longer on screen"})
+		return
+	}
+	st, err := p.steps(a)
+	if err != nil {
+		code := 409 // an option that isn't there: the question changed under the page
+		if err == errNoText {
+			code = 400
+		}
+		writeJSON(w, code, map[string]any{"error": err.Error()})
+		return
+	}
+	what += " answer " + strconv.Quote(trunc(cmp.Or(a.Choose, strings.Join(a.Checks, ", ")), 80))
+	if a.Text != "" {
+		what += " " + strconv.Quote(trunc(a.Text, 80))
+	}
+	for i, x := range st {
+		if i > 0 {
+			time.Sleep(90 * time.Millisecond)
+		}
+		if x.Text != "" {
+			err = s.z.paste(session, pane, x.Text)
+		} else {
+			err = s.z.keys(session, pane, x.Keys...)
+		}
+		if err != nil {
+			s.audit.add("input-fail", what+": "+err.Error(), clientIP(r))
+			writeJSON(w, 502, map[string]any{"error": err.Error()})
+			return
+		}
+	}
+	s.audit.add("input", what, clientIP(r))
+	s.term.reread(session, pane)
+	out := map[string]any{"ok": true}
+	for range 5 { // the dialog's next state: the next question, the review, or gone
+		time.Sleep(120 * time.Millisecond)
+		if screen, err := s.z.dump(session, pane); err == nil {
+			if next := parsePrompt(screen); next == nil || next.Sig != sig {
+				out["moved"], out["prompt"] = true, next
+				break
+			}
+		}
+	}
+	writeJSON(w, 200, out)
 }
 
 // ---- creating sessions, tabs, panes ----
@@ -474,8 +710,8 @@ func (s *server) termNew(w http.ResponseWriter, r *http.Request) {
 	}
 	what := fmt.Sprintf("new %s %s %q in %s", b.What, session, name, tilde(cwd))
 	if err == nil && b.Run == "claude" {
-		what += " running claude" // Launch the standard Claude CLI from the shell PATH.
-		if err = s.z.write(session, pane, "claude"); err == nil {
+		what += " running claude-multi" // the owner's launcher (teamclaude); typed like over SSH so aliases work
+		if err = s.z.write(session, pane, "claude-multi"); err == nil {
 			err = s.z.keys(session, pane, "Enter")
 		}
 	}
@@ -568,6 +804,65 @@ func (s *server) termClose(w http.ResponseWriter, r *http.Request) {
 	}
 	s.audit.add("close", what, clientIP(r))
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// termRename: POST {session, tab?, name}. A tab takes the name (a tab-status mark comes back with that plugin's
+// next update); a session takes a free name.
+func (s *server) termRename(w http.ResponseWriter, r *http.Request) {
+	var b struct {
+		Session, Name string
+		Tab           *int
+	}
+	if err := readJSON(r, &b); err != nil {
+		writeJSON(w, 400, map[string]any{"error": "bad request"})
+		return
+	}
+	bad := func(msg string) { writeJSON(w, 400, map[string]any{"error": msg}) }
+	if !s.sessionLive(b.Session) {
+		bad("no live session " + trunc(b.Session, 64))
+		return
+	}
+	name, ok := cleanName(b.Name)
+	if !ok || name == "" {
+		bad("names are 1 to 64 printable characters")
+		return
+	}
+	var what string
+	var err error
+	if b.Tab != nil {
+		if *b.Tab < 0 {
+			bad("bad tab")
+			return
+		}
+		what = fmt.Sprintf("rename tab %s:%d to %q", b.Session, *b.Tab, name)
+		err = s.z.renameTab(b.Session, *b.Tab, name)
+	} else {
+		switch {
+		case !sessionNameRe.MatchString(name):
+			bad("session names use letters, digits, . _ -")
+			return
+		case name == b.Session:
+			writeJSON(w, 200, map[string]any{"ok": true, "name": name})
+			return
+		case s.sessionLive(name):
+			bad("session " + name + " already exists")
+			return
+		}
+		what = fmt.Sprintf("rename session %s to %s", b.Session, name)
+		err = s.z.renameSession(b.Session, name)
+	}
+	if err != nil {
+		s.audit.add("rename-fail", what+": "+err.Error(), clientIP(r))
+		writeJSON(w, 502, map[string]any{"error": err.Error()})
+		return
+	}
+	s.term.invalidate(b.Session)
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+	s.audit.add("rename", what, clientIP(r))
+	writeJSON(w, 200, map[string]any{"ok": true, "name": name})
 }
 
 // ---- balancer ----
@@ -664,7 +959,14 @@ func uploadName(orig, sniffed string) string {
 	if n == "" || n == "_" {
 		n = "file" + imageExt[sniffed]
 	}
-	return trunc(n, 80)
+	if len(n) > 80 { // shorter, but no "…" (not an upload name) and the extension kept: readers go by it
+		ext := filepath.Ext(n)
+		if len(ext) > 12 {
+			ext = ""
+		}
+		n = n[:80-len(ext)] + ext
+	}
+	return n
 }
 
 // paneUpload stores a file (any type, up to 25 MB) where agents can read it; the chat and the
@@ -723,3 +1025,135 @@ func (s *server) uploadGet(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Write(b)
 }
+
+// ---- the Terminals page: a peek at a pane's screen, and moving a tab to another session ----
+
+// panePeek: the last lines on a pane's screen (a server's log, a shell's prompt). An agent's peek reads its chat
+// instead (GET /api/pane/chat?tail=live or tail=turn).
+func (s *server) panePeek(w http.ResponseWriter, r *http.Request) {
+	session, pane, err := paneParams(r)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"error": err.Error()})
+		return
+	}
+	if _, ok := s.term.pane(session, pane); !ok {
+		writeJSON(w, 404, map[string]any{"error": "no such pane"})
+		return
+	}
+	screen, err := s.z.dump(session, pane)
+	if err != nil {
+		writeJSON(w, 502, map[string]any{"error": err.Error()})
+		return
+	}
+	lines := strings.Split(strings.TrimRight(screen, " \n"), "\n")
+	for i, l := range lines {
+		lines[i] = trunc(strings.TrimRight(l, " "), 400)
+	}
+	writeJSON(w, 200, map[string]any{"screen": lines[max(0, len(lines)-18):]})
+}
+
+// movable says why a tab can't move to another session, or "" when it can. Only what moves without losing
+// anything: a one-pane tab whose Claude isn't working or asking, or a shell at its prompt. A running server
+// would have to restart, which is the owner's call, not a move's.
+func movable(tb TTab) string {
+	if len(tb.Panes) != 1 {
+		return "Only a tab with one pane can move for now."
+	}
+	p := tb.Panes[0]
+	switch {
+	case p.Kind == "codex":
+		return "Only Claude agents can move: Codex can't resume here."
+	case p.Agent != nil:
+		switch p.State {
+		case "working", "background", "stalled", "starting":
+			return "It's working: move it once it stops."
+		case "asking":
+			return "It's asking you something: answer it first."
+		}
+		if p.Agent.sid == "" || p.Agent.startCwd == "" {
+			return "Its conversation can't be found to resume it."
+		}
+	case p.Kind == "claude":
+		return "Its agent isn't tracked yet: try again in a moment."
+	case p.Fg > 0 || p.State == "running":
+		return "What runs in it would restart: stop it, then start it in the other session."
+	}
+	return ""
+}
+
+// termMove moves a tab to another session. Zellij can't carry a pane across sessions, so the panel opens the tab
+// again there, then closes this one: a shell opens in the same folder; Claude resumes the same conversation
+// (claude-multi --resume, in the folder it started in, where its transcript lives), typed only after the old
+// pane has closed, so two Claudes never write one conversation.
+func (s *server) termMove(w http.ResponseWriter, r *http.Request) {
+	var b struct {
+		Session, To string
+		Tab         int
+	}
+	if err := readJSON(r, &b); err != nil {
+		writeJSON(w, 400, map[string]any{"error": "bad request"})
+		return
+	}
+	switch {
+	case !s.sessionLive(b.Session) || !s.sessionLive(b.To):
+		writeJSON(w, 400, map[string]any{"error": "both sessions must be live"})
+		return
+	case b.Session == b.To:
+		writeJSON(w, 400, map[string]any{"error": "it is already in " + b.To})
+		return
+	}
+	tb, ok := s.term.tab(b.Session, b.Tab)
+	if !ok {
+		writeJSON(w, 404, map[string]any{"error": "no such tab"})
+		return
+	}
+	if why := movable(tb); why != "" {
+		writeJSON(w, 409, map[string]any{"error": why})
+		return
+	}
+	p := tb.Panes[0]
+	cwd, cmd := p.cwd, ""
+	if p.Agent != nil {
+		cwd, cmd = p.Agent.startCwd, "claude-multi --resume "+p.Agent.sid
+	}
+	if fi, err := os.Stat(cwd); cwd == "" || err != nil || !fi.IsDir() {
+		writeJSON(w, 409, map[string]any{"error": "its folder is gone, so it can't reopen there"})
+		return
+	}
+	what := fmt.Sprintf("move tab %s:%d %q to %s (%s)", b.Session, b.Tab, tb.Name, b.To, tilde(cwd))
+	fail := func(err error) {
+		s.audit.add("move-fail", what+": "+err.Error(), clientIP(r))
+		writeJSON(w, 502, map[string]any{"error": err.Error()})
+	}
+	pane, err := s.z.newTab(b.To, tb.Name, cwd)
+	if err != nil {
+		fail(err)
+		return
+	}
+	if err := s.z.closePane(b.Session, p.ID); err != nil {
+		fail(fmt.Errorf("opened it in %s, but the old pane did not close: %v", b.To, err))
+		return
+	}
+	if cmd != "" {
+		time.Sleep(moveSettle) // the old Claude takes its hangup and lets go of the conversation
+		err = s.z.write(b.To, pane, cmd)
+		if err == nil {
+			err = s.z.keys(b.To, pane, "Enter")
+		}
+		if err != nil {
+			fail(fmt.Errorf("the tab is in %s, but Claude did not resume: %v", b.To, err))
+			return
+		}
+		what += " resuming " + p.Agent.sid
+	}
+	s.term.invalidate(b.Session)
+	s.term.invalidate(b.To)
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+	s.audit.add("move", what, clientIP(r))
+	writeJSON(w, 200, map[string]any{"ok": true, "session": b.To, "pane": pane})
+}
+
+var moveSettle = 800 * time.Millisecond

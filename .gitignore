@@ -1,5 +1,5 @@
+# the built binary (run-panel.sh builds it on every start)
 /control-panel
-/panel.env
+# runtime: pid files, logs, backups
 /run/
-/.local-state/
-*.token
+scripts/vendor/node_modules

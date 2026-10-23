@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Artifacts: the files a session wrote or edited (Write/Edit/MultiEdit/NotebookEdit), or handed over by
@@ -203,15 +204,7 @@ var fileTypes = map[string]string{
 // paneFile shows one of the session's own files: as JSON (kind + text) for the viewer, or raw
 // (images, sandboxed HTML/SVG, downloads). Anything not in the session's list is a 404.
 func (s *server) paneFile(w http.ResponseWriter, r *http.Request) {
-	_, files, ok := s.paneArtifacts(r)
-	want := r.URL.Query().Get("path")
-	found := false
-	for _, a := range files {
-		found = found || (ok && a.Path == want)
-	}
-	for _, q := range s.secretPaths() { // a message naming ~/.ssh/… doesn't make it downloadable
-		found = found && want != q && !strings.HasPrefix(want, q+"/")
-	}
+	want, found := s.sessionFile(r)
 	if !found {
 		http.NotFound(w, r)
 		return
@@ -265,4 +258,57 @@ func (s *server) paneFile(w http.ResponseWriter, r *http.Request) {
 		out["text"] = string(bytes.ToValidUTF8(buf, []byte("�")))
 	}
 	writeJSON(w, 200, out)
+}
+
+// sessionFile returns ?path= when it is one of the pane session's own files (never a secret path).
+func (s *server) sessionFile(r *http.Request) (string, bool) {
+	_, files, ok := s.paneArtifacts(r)
+	want := r.URL.Query().Get("path")
+	found := false
+	for _, a := range files {
+		found = found || (ok && a.Path == want)
+	}
+	for _, q := range s.secretPaths() { // a message naming ~/.ssh/… doesn't make it downloadable
+		found = found && want != q && !strings.HasPrefix(want, q+"/")
+	}
+	return want, found
+}
+
+// paneFileComments keeps review comments for one of the session's HTML pages in "<page>.comments.json"
+// beside it. The page itself runs sandboxed (no storage, no network), so the preview relays its
+// comments here by postMessage: GET loads them, POST {"comments": [...]} replaces them.
+func (s *server) paneFileComments(w http.ResponseWriter, r *http.Request) {
+	page, found := s.sessionFile(r)
+	if ext := strings.ToLower(filepath.Ext(page)); !found || (ext != ".html" && ext != ".htm") {
+		http.NotFound(w, r)
+		return
+	}
+	store := page + ".comments.json"
+	if r.Method == http.MethodGet {
+		b, err := os.ReadFile(store)
+		if os.IsNotExist(err) {
+			writeJSON(w, 200, map[string]any{"comments": []any{}})
+			return
+		}
+		var v struct{ Comments []json.RawMessage `json:"comments"` }
+		if err != nil || json.Unmarshal(b, &v) != nil {
+			writeJSON(w, 500, map[string]any{"error": "comments file unreadable"})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"comments": v.Comments, "file": store})
+		return
+	}
+	var v struct {
+		Comments []json.RawMessage `json:"comments"`
+	}
+	if err := readJSONN(r, &v, 2<<20); err != nil || v.Comments == nil {
+		writeJSON(w, 400, map[string]any{"error": "want {\"comments\": [...]} under 2 MB"})
+		return
+	}
+	b, _ := json.MarshalIndent(map[string]any{"page": page, "saved_at": time.Now().UTC().Format(time.RFC3339), "comments": v.Comments}, "", "  ")
+	if err := writeFileAtomic(store, b, 0o644); err != nil { // the page's folder may hold links a repo planted
+		writeJSON(w, 500, map[string]any{"error": "could not write the comments file"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"saved": len(v.Comments), "file": store})
 }
